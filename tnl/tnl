@@ -1,0 +1,407 @@
+#!/usr/bin/env python3
+"""
+tnl - Tunnel Client for IT.Box
+Simple client-side tool to manage SSH reverse tunnels to gateway server.
+"""
+
+import os
+import sys
+import subprocess
+import argparse
+from pathlib import Path
+
+# ============================================================================
+# CONSTANTS
+# ============================================================================
+
+VERSION = "1.0.0"
+TUNNELUSER = "tunneluser"
+TUNNELUSER_HOME = "/home/tunneluser"
+SSH_KEY_PATH = f"{TUNNELUSER_HOME}/.ssh/tunnel_key"
+SYSTEMD_SERVICE = "/etc/systemd/system/tnl-admin.service"
+
+# ============================================================================
+# EXCEPTIONS
+# ============================================================================
+
+class TnlError(Exception):
+    """Base exception for tnl errors."""
+    pass
+
+# ============================================================================
+# UTILITIES
+# ============================================================================
+
+def check_root():
+    """Ensure script is run as root."""
+    if os.geteuid() != 0:
+        print("❌ Error: This command must be run as root")
+        print("   Run: sudo tnl ...")
+        sys.exit(1)
+
+def run_command(cmd, check=True, capture_output=False):
+    """Run shell command."""
+    result = subprocess.run(
+        cmd,
+        shell=isinstance(cmd, str),
+        check=check,
+        capture_output=capture_output,
+        text=True
+    )
+    return result
+
+# ============================================================================
+# COMMANDS
+# ============================================================================
+
+def cmd_install(args):
+    """Install tnl client on box."""
+    print("🔧 tnl Client Installation\n")
+
+    check_root()
+
+    # 1. Create tunneluser
+    print("1. Creating tunneluser...")
+    result = run_command(["id", "tunneluser"], check=False, capture_output=True)
+
+    if result.returncode == 0:
+        print("   ✓ User 'tunneluser' already exists")
+        # Ensure home directory exists (might be missing)
+        home_dir = Path(TUNNELUSER_HOME)
+        if not home_dir.exists():
+            print("   Creating home directory...")
+            home_dir.mkdir(mode=0o755, parents=True)
+            import pwd
+            tunneluser_uid = pwd.getpwnam(TUNNELUSER).pw_uid
+            tunneluser_gid = pwd.getpwnam(TUNNELUSER).pw_gid
+            os.chown(home_dir, tunneluser_uid, tunneluser_gid)
+    else:
+        # Create user
+        run_command([
+            "useradd", "-r", "-m",
+            "-d", TUNNELUSER_HOME,
+            "-s", "/bin/bash",
+            TUNNELUSER
+        ])
+        print("   ✓ User 'tunneluser' created")
+
+    # 2. Create SSH directory and key
+    print("\n2. Generating SSH key...")
+    ssh_dir = Path(TUNNELUSER_HOME) / ".ssh"
+    ssh_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+    key_path = Path(SSH_KEY_PATH)
+
+    if key_path.exists():
+        print("   ✓ SSH key already exists")
+    else:
+        # Generate ed25519 key
+        run_command([
+            "ssh-keygen",
+            "-t", "ed25519",
+            "-f", str(key_path),
+            "-N", "",  # No passphrase
+            "-C", f"tunneluser@{os.uname().nodename}"
+        ])
+        print("   ✓ SSH key generated")
+
+    # Set ownership
+    import pwd
+    tunneluser_uid = pwd.getpwnam(TUNNELUSER).pw_uid
+    tunneluser_gid = pwd.getpwnam(TUNNELUSER).pw_gid
+
+    os.chown(ssh_dir, tunneluser_uid, tunneluser_gid)
+    os.chown(key_path, tunneluser_uid, tunneluser_gid)
+    os.chown(str(key_path) + ".pub", tunneluser_uid, tunneluser_gid)
+
+    # 3. Install autossh
+    print("\n3. Installing autossh...")
+    result = run_command(
+        ["which", "autossh"],
+        check=False,
+        capture_output=True
+    )
+
+    if result.returncode == 0:
+        print("   ✓ autossh already installed")
+    else:
+        print("   Installing autossh via apt...")
+        run_command(["apt-get", "update", "-qq"])
+        run_command(["apt-get", "install", "-y", "autossh"])
+        print("   ✓ autossh installed")
+
+    # 4. Copy tnl script to /usr/local/bin
+    print("\n4. Installing tnl command...")
+    current_script = Path(__file__).resolve()
+    target_script = Path("/usr/local/bin/tnl")
+
+    if current_script != target_script:
+        import shutil
+        shutil.copy2(current_script, target_script)
+        os.chmod(target_script, 0o755)
+        print(f"   ✓ Copied to {target_script}")
+    else:
+        print("   ✓ Already installed")
+
+    # 5. Show public key
+    print("\n" + "="*60)
+    print("✓ Installation complete!")
+    print("="*60)
+    print("\n📋 SSH Public Key (register this on gateway server):\n")
+
+    with open(str(key_path) + ".pub", "r") as f:
+        public_key = f.read().strip()
+        print(public_key)
+
+    print("\n" + "="*60)
+    print("\nNext steps:")
+    print("  1. Copy the public key above")
+    print("  2. Register this box on gateway server:")
+    print("     sudo gtwy add-box <box-id> <domain> '<public-key>'")
+    print("\n  3. Get admin port from gateway:")
+    print("     gtwy get-port <box-id>")
+    print("\n  4. Setup tunnel on this box:")
+    print("     sudo tnl setup <gateway-ip> <admin-port>")
+    print("     Example: sudo tnl setup 192.168.1.100 20001")
+    print("="*60)
+
+def cmd_setup(args):
+    """Setup admin SSH tunnel to gateway server."""
+    print("🚀 tnl Tunnel Setup\n")
+
+    check_root()
+
+    if not args.gateway_ip:
+        print("❌ Error: Gateway IP and admin port required")
+        print("   Usage: sudo tnl setup <gateway-ip> <admin-port> [ssh-port]")
+        sys.exit(1)
+
+    if not args.admin_port:
+        print("❌ Error: Admin port required (from 'gtwy get-port <box-id>')")
+        print("   Usage: sudo tnl setup <gateway-ip> <admin-port> [ssh-port]")
+        sys.exit(1)
+
+    gateway_ip = args.gateway_ip
+    admin_port = args.admin_port
+    ssh_port = args.ssh_port if args.ssh_port else 22
+
+    print(f"Gateway IP:    {gateway_ip}")
+    print(f"Gateway SSH:   {ssh_port}")
+    print(f"Admin Port:    {admin_port} (reverse tunnel)")
+
+    # 1. Test SSH connection
+    print("\n1. Testing SSH connection...")
+    key_path = Path(SSH_KEY_PATH)
+
+    if not key_path.exists():
+        print("❌ Error: SSH key not found")
+        print("   Run 'sudo tnl install' first")
+        sys.exit(1)
+
+    result = run_command(
+        [
+            "sudo", "-u", TUNNELUSER,
+            "ssh",
+            "-i", str(key_path),
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "ConnectTimeout=5",
+            "-p", str(ssh_port),
+            f"tunneluser@{gateway_ip}"
+        ],
+        check=False,
+        capture_output=True
+    )
+
+    # Check if connection was successful
+    # The command will fail because of command restriction, but that's OK
+    # We just need to check if we could connect
+    if "usage: gtwy request" in result.stderr or "BOX_ID" in result.stderr:
+        # Connection successful! Gateway executed the restricted command
+        print("   ✓ SSH connection successful")
+    elif result.returncode != 0:
+        print(f"❌ Error: Cannot connect to gateway")
+        print(f"   {result.stderr.strip()}")
+        print("\nMake sure:")
+        print("  1. Public key is registered on gateway server")
+        print("  2. Gateway IP and port are correct")
+        print("  3. Firewall allows connection")
+        sys.exit(1)
+    else:
+        print("   ✓ SSH connection successful")
+
+    # 2. Create systemd service
+    print("\n2. Creating systemd service...")
+
+    service_content = f"""[Unit]
+Description=tnl Admin SSH Tunnel (Reverse: Gateway:{admin_port} → Box:22)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={TUNNELUSER}
+Restart=always
+RestartSec=10
+ExecStart=/usr/bin/autossh -M 0 -N -o "ServerAliveInterval=30" -o "ServerAliveCountMax=3" -o "ExitOnForwardFailure=yes" -o "StrictHostKeyChecking=no" -i {SSH_KEY_PATH} -R {admin_port}:localhost:22 -p {ssh_port} tunneluser@{gateway_ip}
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+    with open(SYSTEMD_SERVICE, "w") as f:
+        f.write(service_content)
+
+    print(f"   ✓ Service created: {SYSTEMD_SERVICE}")
+
+    # 3. Reload systemd and enable service
+    print("\n3. Enabling service...")
+    run_command(["systemctl", "daemon-reload"])
+    run_command(["systemctl", "enable", "tnl-admin.service"])
+    print("   ✓ Service enabled")
+
+    # 4. Start service
+    print("\n4. Starting service...")
+    run_command(["systemctl", "restart", "tnl-admin.service"])
+    print("   ✓ Service started")
+
+    # 5. Check status
+    print("\n5. Checking status...")
+    import time
+    time.sleep(2)
+
+    result = run_command(
+        ["systemctl", "is-active", "tnl-admin.service"],
+        check=False,
+        capture_output=True
+    )
+
+    if result.stdout.strip() == "active":
+        print("   ✓ Tunnel is active")
+    else:
+        print("   ⚠ Tunnel status:", result.stdout.strip())
+        print("\n   Check logs with: journalctl -u tnl-admin.service -f")
+
+    print("\n" + "="*60)
+    print("✓ Setup complete!")
+    print("="*60)
+    print(f"\nAdmin SSH tunnel is now running:")
+    print(f"  Gateway:{admin_port} → Box:22 (localhost only)")
+    print("\nFrom gateway server, connect to this box:")
+    print(f"  ssh -p {admin_port} <user>@localhost")
+    print("\nUseful commands:")
+    print("  sudo systemctl status tnl-admin     # Check status")
+    print("  sudo systemctl restart tnl-admin    # Restart tunnel")
+    print("  sudo systemctl stop tnl-admin       # Stop tunnel")
+    print("  sudo journalctl -u tnl-admin -f     # View logs")
+    print("="*60)
+
+def cmd_status(args):
+    """Show tunnel status."""
+    check_root()
+
+    print("📊 tnl Status\n")
+
+    # Check if service exists
+    if not Path(SYSTEMD_SERVICE).exists():
+        print("❌ Tunnel not configured")
+        print("   Run 'sudo tnl setup <gateway-ip> <admin-port>' first")
+        return
+
+    # Service status
+    result = run_command(
+        ["systemctl", "is-active", "tnl-admin.service"],
+        check=False,
+        capture_output=True
+    )
+    status = result.stdout.strip()
+
+    if status == "active":
+        print("✓ Admin Tunnel: ACTIVE")
+    else:
+        print(f"✗ Admin Tunnel: {status.upper()}")
+
+    # Show recent logs
+    print("\nRecent logs:")
+    print("-" * 60)
+    run_command([
+        "journalctl", "-u", "tnl-admin.service",
+        "-n", "10", "--no-pager"
+    ])
+
+def cmd_version(args):
+    """Show version."""
+    print(f"tnl v{VERSION}")
+
+# ============================================================================
+# ARGUMENT PARSER
+# ============================================================================
+
+def build_parser():
+    """Build argument parser."""
+    parser = argparse.ArgumentParser(
+        prog='tnl',
+        description='Tunnel Client for IT.Box'
+    )
+
+    subparsers = parser.add_subparsers(dest='command', help='Commands')
+
+    # install
+    p_install = subparsers.add_parser(
+        'install',
+        help='Install tnl client (one-time setup)'
+    )
+    p_install.set_defaults(func=cmd_install)
+
+    # setup
+    p_setup = subparsers.add_parser(
+        'setup',
+        help='Setup admin SSH tunnel to gateway'
+    )
+    p_setup.add_argument('gateway_ip', help='Gateway server IP or hostname')
+    p_setup.add_argument('admin_port', type=int,
+                        help='Admin SSH port (from gtwy get-port)')
+    p_setup.add_argument('ssh_port', nargs='?', type=int, default=22,
+                        help='Gateway SSH port (default: 22)')
+    p_setup.set_defaults(func=cmd_setup)
+
+    # status
+    p_status = subparsers.add_parser(
+        'status',
+        help='Show tunnel status'
+    )
+    p_status.set_defaults(func=cmd_status)
+
+    # version
+    p_version = subparsers.add_parser('version', help='Show version')
+    p_version.set_defaults(func=cmd_version)
+
+    return parser
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+def main():
+    """Main entry point."""
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(0)
+
+    try:
+        args.func(args)
+        sys.exit(0)
+    except TnlError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\nAborted.", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Unexpected error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()

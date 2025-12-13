@@ -1,0 +1,111 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info
+dist/
+build/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environments
+venv/
+ENV/
+env/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*.swn
+.claude/
+*.sublime-project
+*.sublime-workspace
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+*~
+
+# Configuration (local/sensitive)
+config.yml
+tunnels.db
+*.log
+*.db
+
+# Secrets - NEVER commit these!
+**/api-keys.md
+**/secrets.yml
+**/credentials.yml
+**/.env
+**/.env.local
+
+# Build artifacts
+*.tar.gz
+*.zip
+*.deb
+*.rpm
+
+# Documentation drafts (exclude from repo)
+documentation/
+legacy/
+
+# Backup files
+*.bak
+*.backup
+*~
+
+# Test files
+test_config.yml
+test_tunnels.db
+
+# Certificates (managed by certbot)
+*.pem
+*.key
+*.crt
+*.csr
+
+# nginx generated configs (managed by gtwy)
+tunnels-autogen.conf
+
+# systemd service files on production (managed by tnl)
+/etc/systemd/system/tnl-admin.service
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Coverage reports
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+
+# pytest
+.pytest_cache/
+
+# MyPy
+.mypy_cache/
+.dmypy.json
+dmypy.json

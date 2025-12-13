@@ -1,0 +1,22 @@
+# gtwy - Tunnel Gateway Manager
+# Python Package Requirements
+
+# YAML parsing for configuration files
+PyYAML>=6.0
+
+# HTTP requests for IONOS DNS API
+requests>=2.31.0
+
+# Note: The following are part of Python standard library (no installation needed):
+# - sqlite3 (database)
+# - subprocess (system commands)
+# - argparse (CLI)
+# - logging (logging)
+# - hashlib (SSH fingerprints)
+# - base64 (SSH key parsing)
+# - shutil (file operations)
+# - tarfile (backup/restore)
+# - pathlib (path handling)
+# - datetime (timestamps)
+# - re (regex validation)
+# - os, sys (system operations)

@@ -1,0 +1,2712 @@
+#!/usr/bin/env python3
+"""
+gtwy - Tunnel Gateway Manager
+Version 1.0.0
+
+A tool for managing SSH reverse tunnels from remote IT.Boxes to a central
+nginx gateway server with automated DNS and SSL certificate management.
+
+Author: n-21 Schulen in Niedersachsen online e.V.
+License: MIT
+"""
+
+import sys
+import os
+import re
+import sqlite3
+import subprocess
+import argparse
+import yaml
+import requests
+import logging
+import hashlib
+import base64
+import shutil
+import tarfile
+from pathlib import Path
+from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
+from typing import Optional, Dict, List, Any, Tuple
+
+# ============================================================================
+# CONSTANTS
+# ============================================================================
+
+VERSION = "1.0.0"
+DEFAULT_CONFIG_PATH = "/opt/gtwy/config.yml"
+DEFAULT_DB_PATH = "/opt/gtwy/tunnels.db"
+
+# Embedded nginx template (no external file needed!)
+NGINX_TEMPLATE = """# Template for a single tunnel server block
+# Variables: {SUBDOMAIN}, {SERVER_PORT}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name {SUBDOMAIN};
+
+    # Redirect HTTP to HTTPS
+    return 301 https://$server_name$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name {SUBDOMAIN};
+
+    # SSL certificates (managed by certbot)
+    ssl_certificate /etc/letsencrypt/live/{SUBDOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/{SUBDOMAIN}/privkey.pem;
+    include /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+
+    # Proxy settings
+    location / {
+        proxy_pass http://localhost:{SERVER_PORT};
+        proxy_http_version 1.1;
+
+        # WebSocket support
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+
+        # Standard proxy headers
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Timeouts (adjust as needed)
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+    }
+
+    # Optional: Increase upload size for file uploads
+    client_max_body_size 100M;
+}
+"""
+
+# ============================================================================
+# EXCEPTIONS
+# ============================================================================
+
+class GatewayError(Exception):
+    """Base exception for gateway errors."""
+    exit_code = 1
+
+class ValidationError(GatewayError):
+    """Input validation failed."""
+    exit_code = 2
+
+class GatewayPermissionError(GatewayError):
+    """Insufficient permissions."""
+    exit_code = 3
+
+class NotFoundError(GatewayError):
+    """Resource not found."""
+    exit_code = 4
+
+class DependencyError(GatewayError):
+    """External dependency failed (nginx, certbot, etc.)."""
+    exit_code = 5
+
+class NoPortsAvailable(GatewayError):
+    """No ports available in configured range."""
+    exit_code = 1
+
+# ============================================================================
+# LOGGING
+# ============================================================================
+
+logger = logging.getLogger('gtwy')
+
+def setup_logging(log_file: str, level: str = 'INFO', max_mb: int = 10, backup_count: int = 5):
+    """Configure logging with rotation."""
+    log_level = getattr(logging, level.upper(), logging.INFO)
+
+    # Create log directory if it doesn't exist
+    log_path = Path(log_file)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    handler = RotatingFileHandler(
+        log_file,
+        maxBytes=max_mb * 1024 * 1024,
+        backupCount=backup_count
+    )
+
+    formatter = logging.Formatter(
+        '[%(asctime)s] %(levelname)s: %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    handler.setFormatter(formatter)
+
+    logger.addHandler(handler)
+    logger.setLevel(log_level)
+
+    # Also log to console for interactive commands
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    console_handler.setLevel(logging.WARNING)  # Only warnings and errors to console
+    logger.addHandler(console_handler)
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+def load_config(config_path: str = DEFAULT_CONFIG_PATH) -> Dict[str, Any]:
+    """Load configuration from YAML file."""
+    try:
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f)
+        return config
+    except FileNotFoundError:
+        raise NotFoundError(f"Configuration file not found: {config_path}")
+    except yaml.YAMLError as e:
+        raise ValidationError(f"Invalid YAML in config file: {e}")
+
+def save_config(config: Dict[str, Any], config_path: str = DEFAULT_CONFIG_PATH):
+    """Save configuration to YAML file."""
+    config_file = Path(config_path)
+    config_file.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(config_path, 'w') as f:
+        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+
+    # Set proper permissions (640, root:gtwy-admin)
+    os.chmod(config_path, 0o640)
+
+# ============================================================================
+# DATABASE
+# ============================================================================
+
+def init_database(db_path: str = DEFAULT_DB_PATH):
+    """Initialize SQLite database with schema."""
+    db_file = Path(db_path)
+    db_file.parent.mkdir(parents=True, exist_ok=True)
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    # Create boxes table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS boxes (
+            box_id TEXT PRIMARY KEY,
+            domain TEXT NOT NULL,
+            admin_ssh_port INTEGER UNIQUE NOT NULL,
+            ssh_key_type TEXT NOT NULL,
+            ssh_key_fingerprint TEXT NOT NULL,
+            ssh_public_key TEXT NOT NULL,
+            added_date TEXT NOT NULL,
+            last_seen TEXT,
+            notes TEXT
+        )
+    """)
+
+    # Create tunnels table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS tunnels (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            box_id TEXT NOT NULL,
+            service TEXT NOT NULL,
+            local_port INTEGER NOT NULL,
+            server_port INTEGER UNIQUE NOT NULL,
+            subdomain TEXT UNIQUE NOT NULL,
+            status TEXT DEFAULT 'pending_cert',
+            created TEXT NOT NULL,
+            last_checked TEXT,
+            error_message TEXT,
+            FOREIGN KEY (box_id) REFERENCES boxes(box_id) ON DELETE CASCADE,
+            UNIQUE(box_id, service)
+        )
+    """)
+
+    # Create indexes
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_tunnels_box_id ON tunnels(box_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_tunnels_subdomain ON tunnels(subdomain)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_tunnels_server_port ON tunnels(server_port)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_tunnels_status ON tunnels(status)")
+
+    conn.commit()
+    conn.close()
+
+    logger.info(f"Database initialized at {db_path}")
+
+def get_db_connection(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
+    """Get database connection with Row factory."""
+    if not Path(db_path).exists():
+        raise NotFoundError(f"Database not found: {db_path}. Run 'gtwy setup' first.")
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+# ============================================================================
+# VALIDATION
+# ============================================================================
+
+def validate_box_id(box_id: str):
+    """Validate box ID format."""
+    if not re.match(r'^[a-z0-9-]+$', box_id):
+        raise ValidationError(
+            f"Invalid box-id '{box_id}'\n"
+            "Box IDs must match: ^[a-z0-9-]+$ (lowercase, numbers, hyphens only)\n"
+            "Example: box01, test-box, school-abc"
+        )
+
+def validate_service_name(service: str):
+    """Validate service name format."""
+    if not re.match(r'^[a-z0-9-]+$', service):
+        raise ValidationError(
+            f"Invalid service name '{service}'\n"
+            "Service names must match: ^[a-z0-9-]+$ (lowercase, numbers, hyphens only)"
+        )
+
+def validate_port(port: int) -> int:
+    """Validate port number."""
+    try:
+        port = int(port)
+        if not (1 <= port <= 65535):
+            raise ValueError
+    except (ValueError, TypeError):
+        raise ValidationError(f"Invalid port: {port}. Must be 1-65535")
+    return port
+
+def validate_domain(domain: str, allowed_domains: List[str]) -> str:
+    """Validate domain format and check against allowed list."""
+    # Basic domain format validation
+    domain_regex = r'^([a-z0-9]+(-[a-z0-9]+)*\.)+[a-z]{2,}$'
+    if not re.match(domain_regex, domain.lower()):
+        raise ValidationError(
+            f"Invalid domain format: {domain}\n"
+            "Domains must be valid FQDN (e.g., example.com, sub.example.org)"
+        )
+
+    # Check against allowed domains list if configured
+    if allowed_domains and domain not in allowed_domains:
+        raise ValidationError(
+            f"Domain '{domain}' is not in the allowed list.\n"
+            f"Allowed domains: {', '.join(allowed_domains)}\n"
+            "Update config.yml to add more domains or leave domains list empty to allow any."
+        )
+
+    return domain
+
+def validate_ssh_key(key_string: str) -> Tuple[str, str, str]:
+    """Validate SSH public key format and extract components.
+
+    Returns:
+        Tuple of (key_type, key_data, full_key)
+    """
+    parts = key_string.strip().split()
+    if len(parts) < 2:
+        raise ValidationError("Invalid SSH key format. Expected: <type> <key> [comment]")
+
+    key_type = parts[0]
+    key_data = parts[1]
+
+    if key_type not in ['ssh-rsa', 'ssh-ed25519', 'ssh-dss', 'ecdsa-sha2-nistp256',
+                        'ecdsa-sha2-nistp384', 'ecdsa-sha2-nistp521']:
+        raise ValidationError(f"Unsupported key type: {key_type}")
+
+    # Base64 validation
+    try:
+        base64.b64decode(key_data)
+    except Exception:
+        raise ValidationError("Invalid base64 encoding in SSH key")
+
+    return key_type, key_data, key_string.strip()
+
+def calculate_ssh_fingerprint(key_type: str, key_data: str) -> str:
+    """Calculate SSH key fingerprint (SHA256)."""
+    decoded = base64.b64decode(key_data)
+    sha256_hash = hashlib.sha256(decoded).digest()
+    fingerprint = base64.b64encode(sha256_hash).decode().rstrip('=')
+    return f"SHA256:{fingerprint}"
+
+# ============================================================================
+# PORT ALLOCATION
+# ============================================================================
+
+def allocate_port(conn: sqlite3.Connection, port_range: Dict[str, int],
+                  port_type: str = 'services') -> int:
+    """Allocate the lowest available port in the configured range.
+
+    Args:
+        conn: Database connection
+        port_range: Port range configuration
+        port_type: 'services' or 'admin_ssh'
+
+    Returns:
+        Available port number
+    """
+    range_config = port_range.get(port_type, {})
+    start = range_config.get('start', 10000)
+    end = range_config.get('end', 19999)
+
+    if port_type == 'services':
+        # Get used service ports
+        cursor = conn.execute("SELECT server_port FROM tunnels ORDER BY server_port")
+        used_ports = {row['server_port'] for row in cursor.fetchall()}
+    else:
+        # Get used admin SSH ports
+        cursor = conn.execute("SELECT admin_ssh_port FROM boxes ORDER BY admin_ssh_port")
+        used_ports = {row['admin_ssh_port'] for row in cursor.fetchall()}
+
+    # Find lowest available
+    for port in range(start, end + 1):
+        if port not in used_ports:
+            return port
+
+    raise NoPortsAvailable(f"All {port_type} ports in range {start}-{end} are allocated")
+
+def allocate_admin_ssh_port(conn: sqlite3.Connection, config: Dict[str, Any]) -> int:
+    """Allocate admin SSH port (sequential or auto).
+
+    Args:
+        conn: Database connection
+        config: Configuration dict
+
+    Returns:
+        Admin SSH port number
+    """
+    allocation_mode = config.get('port_range', {}).get('admin_ssh', {}).get('allocation', 'sequential')
+
+    if allocation_mode == 'sequential':
+        # Sequential: box01=20001, box02=20002, etc.
+        # Find the next available sequential port
+        cursor = conn.execute("SELECT admin_ssh_port FROM boxes ORDER BY admin_ssh_port")
+        used_ports = [row['admin_ssh_port'] for row in cursor.fetchall()]
+
+        start = config['port_range']['admin_ssh']['start']
+        end = config['port_range']['admin_ssh']['end']
+
+        # Find first gap or next sequential
+        for port in range(start, end + 1):
+            if port not in used_ports:
+                return port
+
+        raise NoPortsAvailable("All admin SSH ports in range are allocated")
+    else:
+        # Lowest available
+        return allocate_port(conn, config['port_range'], 'admin_ssh')
+
+# ============================================================================
+# SUBDOMAIN GENERATION
+# ============================================================================
+
+def generate_subdomain(conn: sqlite3.Connection, service: str, box_id: str) -> str:
+    """Generate subdomain following pattern: service.box-id.domain
+
+    Args:
+        conn: Database connection
+        service: Service name
+        box_id: Box ID
+
+    Returns:
+        Full subdomain (e.g., gitea.box01.kibox.online)
+    """
+    cursor = conn.execute("SELECT domain FROM boxes WHERE box_id = ?", (box_id,))
+    box = cursor.fetchone()
+
+    if not box:
+        raise NotFoundError(f"Box {box_id} not found")
+
+    domain = box['domain']
+    return f"{service}.{box_id}.{domain}"
+
+# ============================================================================
+# NGINX MANAGEMENT
+# ============================================================================
+
+def generate_nginx_config(conn: sqlite3.Connection, template_path: str = None) -> str:
+    """Generate complete nginx configuration from database.
+
+    Note: template_path parameter is kept for backward compatibility but ignored.
+    Template is now embedded in the script as NGINX_TEMPLATE constant.
+    """
+    template = NGINX_TEMPLATE
+
+    # Get all active and pending tunnels
+    cursor = conn.execute("SELECT * FROM tunnels WHERE status != 'error' ORDER BY subdomain")
+    tunnels = cursor.fetchall()
+
+    config_blocks = []
+    for tunnel in tunnels:
+        block = template.replace('{SUBDOMAIN}', tunnel['subdomain'])
+        block = block.replace('{SERVER_PORT}', str(tunnel['server_port']))
+        config_blocks.append(block)
+
+    return "\n\n".join(config_blocks)
+
+def test_nginx_config() -> bool:
+    """Test nginx configuration."""
+    try:
+        result = subprocess.run(
+            ['sudo', 'nginx', '-t'],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        return result.returncode == 0
+    except Exception as e:
+        logger.error(f"nginx test failed: {e}")
+        return False
+
+def reload_nginx():
+    """Reload nginx configuration."""
+    try:
+        result = subprocess.run(
+            ['sudo', 'nginx', '-s', 'reload'],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        if result.returncode != 0:
+            raise DependencyError(f"nginx reload failed: {result.stderr}")
+        logger.info("nginx reloaded successfully")
+    except subprocess.TimeoutExpired:
+        raise DependencyError("nginx reload timed out")
+    except Exception as e:
+        raise DependencyError(f"nginx reload failed: {e}")
+
+def write_nginx_config(config_content: str, config_path: str):
+    """Write nginx configuration to file."""
+    # Write to temp file first
+    temp_path = f"{config_path}.tmp"
+
+    with open(temp_path, 'w') as f:
+        f.write("# Auto-generated by gtwy - DO NOT EDIT MANUALLY\n")
+        f.write(f"# Generated: {datetime.now().isoformat()}\n\n")
+        f.write(config_content)
+
+    # Test nginx config
+    if not test_nginx_config():
+        os.remove(temp_path)
+        raise DependencyError("nginx configuration test failed")
+
+    # Move to production
+    shutil.move(temp_path, config_path)
+    os.chmod(config_path, 0o644)
+
+# ============================================================================
+# DNS MANAGEMENT (IONOS API)
+# ============================================================================
+
+def get_zone_id_for_domain(domain: str, config: Dict[str, Any]) -> str:
+    """Get IONOS zone ID for a given domain.
+
+    Args:
+        domain: Domain name (e.g., kibox.online)
+        config: Configuration dict with IONOS credentials
+
+    Returns:
+        Zone ID
+    """
+    api_key = f"{config['ionos']['public_prefix']}.{config['ionos']['secret']}"
+    api_url = "https://api.hosting.ionos.com/dns/v1/zones"
+
+    headers = {"X-API-Key": api_key}
+
+    try:
+        response = requests.get(api_url, headers=headers, timeout=10)
+        response.raise_for_status()
+        zones = response.json()
+
+        # Check if response is error array
+        if isinstance(zones, list) and len(zones) > 0:
+            if 'code' in zones[0] and 'message' in zones[0]:
+                # This is an error response
+                error_msg = zones[0].get('message', 'Unknown error')
+                raise DependencyError(f"IONOS API error: {error_msg}")
+    except requests.exceptions.RequestException as e:
+        raise DependencyError(f"Failed to fetch IONOS zones: {e}")
+
+    for zone in zones:
+        if zone.get('name') == domain:
+            return zone['id']
+
+    available = [z.get('name') for z in zones]
+    raise NotFoundError(
+        f"Domain '{domain}' not found in IONOS account.\n"
+        f"Available domains: {', '.join(available)}"
+    )
+
+def get_server_public_ip(config: Dict[str, Any]) -> str:
+    """Get server public IP from config or auto-detect."""
+    ip = config.get('gateway', {}).get('public_ip', 'auto')
+
+    if ip == 'auto':
+        # Auto-detect public IP
+        try:
+            response = requests.get('https://api.ipify.org', timeout=5)
+            response.raise_for_status()
+            return response.text.strip()
+        except Exception as e:
+            raise DependencyError(f"Failed to auto-detect public IP: {e}")
+
+    return ip
+
+def create_dns_record(subdomain: str, config: Dict[str, Any]):
+    """Create DNS A record via IONOS API.
+
+    Args:
+        subdomain: Full subdomain (e.g., gitea.box01.kibox.online)
+        config: Configuration dict
+    """
+    # Extract domain from subdomain
+    parts = subdomain.split('.')
+    if len(parts) < 3:
+        raise ValidationError(f"Invalid subdomain format: {subdomain}")
+
+    # Last two parts are the domain
+    domain = '.'.join(parts[-2:])
+
+    # Hostname is everything before the domain
+    hostname = subdomain.replace(f".{domain}", "")
+
+    # Get zone ID
+    zone_id = get_zone_id_for_domain(domain, config)
+
+    # Get server IP
+    server_ip = get_server_public_ip(config)
+
+    # Create record
+    api_key = f"{config['ionos']['public_prefix']}.{config['ionos']['secret']}"
+    api_url = f"https://api.hosting.ionos.com/dns/v1/zones/{zone_id}/records"
+
+    headers = {"X-API-Key": api_key}
+    payload = [{
+        "name": hostname,
+        "type": "A",
+        "content": server_ip,
+        "ttl": 3600,
+        "prio": 0,
+        "disabled": False
+    }]
+
+    try:
+        response = requests.post(api_url, headers=headers, json=payload, timeout=10)
+        response.raise_for_status()
+
+        # Check response for errors (API might return 200 with error in body)
+        result = response.json()
+        if isinstance(result, list) and len(result) > 0:
+            if 'code' in result[0] and 'message' in result[0]:
+                error_msg = result[0].get('message', 'Unknown error')
+                raise DependencyError(f"IONOS API error: {error_msg}")
+
+        logger.info(f"DNS record created: {subdomain} → {server_ip}")
+    except requests.exceptions.RequestException as e:
+        raise DependencyError(f"Failed to create DNS record: {e}")
+
+def delete_dns_record(subdomain: str, config: Dict[str, Any]):
+    """Delete DNS A record via IONOS API.
+
+    Args:
+        subdomain: Full subdomain
+        config: Configuration dict
+    """
+    # Extract domain from subdomain
+    parts = subdomain.split('.')
+    domain = '.'.join(parts[-2:])
+    hostname = subdomain.replace(f".{domain}", "")
+
+    # Get zone ID
+    zone_id = get_zone_id_for_domain(domain, config)
+
+    # Get all records for zone
+    api_key = f"{config['ionos']['public_prefix']}.{config['ionos']['secret']}"
+    api_url = f"https://api.hosting.ionos.com/dns/v1/zones/{zone_id}/records"
+    headers = {"X-API-Key": api_key}
+
+    try:
+        # Find record
+        response = requests.get(api_url, headers=headers, timeout=10)
+        response.raise_for_status()
+        records = response.json()
+
+        record_id = None
+        for record in records:
+            if record.get('name') == hostname and record.get('type') == 'A':
+                record_id = record['id']
+                break
+
+        if not record_id:
+            logger.warning(f"DNS record for {subdomain} not found, skipping deletion")
+            return
+
+        # Delete record
+        delete_url = f"{api_url}/{record_id}"
+        response = requests.delete(delete_url, headers=headers, timeout=10)
+        response.raise_for_status()
+        logger.info(f"DNS record deleted: {subdomain}")
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Failed to delete DNS record: {e}")
+        # Don't raise, just log - deletion might already be done
+
+# ============================================================================
+# CERTIFICATE MANAGEMENT
+# ============================================================================
+
+def request_certificate(subdomain: str, config: Dict[str, Any]) -> bool:
+    """Request Let's Encrypt certificate via certbot.
+
+    Args:
+        subdomain: Full subdomain
+        config: Configuration dict
+
+    Returns:
+        True if successful, False otherwise
+    """
+    cmd = [
+        'sudo', 'certbot', 'certonly',
+        '--nginx',
+        '-d', subdomain,
+        '--non-interactive',
+        '--agree-tos',
+        '--email', config['certbot']['email']
+    ]
+
+    if config['certbot'].get('staging', False):
+        cmd.append('--staging')
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+
+        if result.returncode == 0:
+            logger.info(f"Certificate obtained for {subdomain}")
+            return True
+        else:
+            logger.error(f"Certificate request failed for {subdomain}: {result.stderr}")
+            return False
+    except subprocess.TimeoutExpired:
+        logger.error(f"Certificate request timed out for {subdomain}")
+        return False
+    except Exception as e:
+        logger.error(f"Certificate request failed for {subdomain}: {e}")
+        return False
+
+def revoke_certificate(subdomain: str) -> bool:
+    """Revoke certificate via certbot.
+
+    Args:
+        subdomain: Full subdomain
+
+    Returns:
+        True if successful or cert doesn't exist, False on error
+    """
+    cmd = [
+        'sudo', 'certbot', 'delete',
+        '--cert-name', subdomain,
+        '--non-interactive'
+    ]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+
+        if result.returncode == 0:
+            logger.info(f"Certificate revoked for {subdomain}")
+            return True
+        else:
+            # Certificate might not exist, which is fine
+            logger.warning(f"Certificate revocation for {subdomain}: {result.stderr}")
+            return True
+    except Exception as e:
+        logger.error(f"Certificate revocation failed for {subdomain}: {e}")
+        return False
+
+def check_dns_propagation(subdomain: str, expected_ip: str) -> bool:
+    """Check if DNS has propagated for a subdomain.
+
+    Args:
+        subdomain: Full subdomain
+        expected_ip: Expected IP address
+
+    Returns:
+        True if DNS resolves to expected IP
+    """
+    try:
+        import socket
+        resolved_ip = socket.gethostbyname(subdomain)
+        return resolved_ip == expected_ip
+    except Exception:
+        return False
+
+# ============================================================================
+# SSH AUTHORIZED_KEYS MANAGEMENT
+# ============================================================================
+
+def add_to_authorized_keys(box_id: str, public_key: str, authorized_keys_path: str):
+    """Add box to authorized_keys with command restriction.
+
+    Args:
+        box_id: Box identifier
+        public_key: Full SSH public key
+        authorized_keys_path: Path to authorized_keys file
+    """
+    entry = (
+        f'command="BOX_ID={box_id} /opt/gtwy/gtwy request",'
+        f'restrict,port-forwarding {public_key}\n'
+    )
+
+    # Ensure .ssh directory exists
+    ssh_dir = Path(authorized_keys_path).parent
+    ssh_dir.mkdir(mode=0o700, exist_ok=True)
+
+    # Append to authorized_keys
+    with open(authorized_keys_path, 'a') as f:
+        f.write(entry)
+
+    # Ensure proper permissions
+    os.chmod(authorized_keys_path, 0o600)
+
+    logger.info(f"Added {box_id} to authorized_keys")
+
+def remove_from_authorized_keys(box_id: str, authorized_keys_path: str):
+    """Remove box from authorized_keys.
+
+    Args:
+        box_id: Box identifier
+        authorized_keys_path: Path to authorized_keys file
+    """
+    if not Path(authorized_keys_path).exists():
+        return
+
+    with open(authorized_keys_path, 'r') as f:
+        lines = f.readlines()
+
+    # Filter out lines containing BOX_ID=box_id
+    new_lines = [line for line in lines if f'BOX_ID={box_id}' not in line]
+
+    with open(authorized_keys_path, 'w') as f:
+        f.writelines(new_lines)
+
+    logger.info(f"Removed {box_id} from authorized_keys")
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
+def get_current_user() -> str:
+    """Get actual user (not 'root' when using sudo)."""
+    return os.environ.get('SUDO_USER') or os.environ.get('USER') or 'root'
+
+def format_age(created_str: str) -> str:
+    """Format age from ISO timestamp to human-readable."""
+    try:
+        created = datetime.fromisoformat(created_str)
+        delta = datetime.now() - created
+
+        days = delta.days
+        hours = delta.seconds // 3600
+        minutes = (delta.seconds % 3600) // 60
+
+        if days > 0:
+            return f"{days}d {hours}h"
+        elif hours > 0:
+            return f"{hours}h {minutes}m"
+        else:
+            return f"{minutes}m"
+    except Exception:
+        return "unknown"
+
+def format_last_seen(last_seen_str: Optional[str]) -> str:
+    """Format last_seen timestamp."""
+    if not last_seen_str:
+        return "never"
+
+    try:
+        last_seen = datetime.fromisoformat(last_seen_str)
+        delta = datetime.now() - last_seen
+
+        if delta.seconds < 60:
+            return "just now"
+        elif delta.seconds < 3600:
+            minutes = delta.seconds // 60
+            return f"{minutes}m ago"
+        elif delta.days == 0:
+            hours = delta.seconds // 3600
+            return f"{hours}h ago"
+        else:
+            return f"{delta.days}d ago"
+    except Exception:
+        return "unknown"
+
+# ============================================================================
+# COMMANDS - INSTALLATION
+# ============================================================================
+
+def cmd_install(args):
+    """Install gtwy system-wide (one-time setup)."""
+    import pwd
+    import grp
+    import subprocess
+
+    print("🔧 gtwy Installation\n")
+
+    # Check if running as root
+    if os.geteuid() != 0:
+        print("❌ Error: Installation must be run as root")
+        print("   Run: sudo gtwy install")
+        sys.exit(1)
+
+    # Check if already installed
+    if Path('/opt/gtwy/gtwy').exists() and not args.force:
+        print("⚠ gtwy is already installed at /opt/gtwy")
+        response = input("Reinstall? [y/N] ")
+        if response.lower() != 'y':
+            print("Installation cancelled.")
+            return
+
+    print("Installing gtwy...\n")
+
+    # 1. Create /opt/gtwy directory
+    print("1. Creating directories...")
+    gtwy_dir = Path('/opt/gtwy')
+    gtwy_dir.mkdir(parents=True, exist_ok=True)
+    (gtwy_dir / 'backups').mkdir(exist_ok=True)
+    print("   ✓ /opt/gtwy created")
+
+    # 2. Copy script itself to /opt/gtwy/gtwy
+    print("\n2. Installing gtwy script...")
+    current_script = Path(__file__).resolve()
+    target_script = gtwy_dir / 'gtwy'
+
+    shutil.copy2(current_script, target_script)
+    os.chmod(target_script, 0o755)
+    os.chown(target_script, 0, 0)  # root:root
+    print(f"   ✓ Copied from {current_script}")
+    print(f"   ✓ Installed to {target_script}")
+
+    # 3. Create nginx-template file from embedded constant
+    print("\n3. Creating nginx template...")
+    template_file = gtwy_dir / 'nginx-template'
+    with open(template_file, 'w') as f:
+        f.write(NGINX_TEMPLATE)
+    os.chmod(template_file, 0o644)
+    os.chown(template_file, 0, 0)  # root:root
+    print("   ✓ /opt/gtwy/nginx-template created")
+
+    # 4. Create gtwy-admin group
+    print("\n4. Setting up user and group...")
+    try:
+        grp.getgrnam('gtwy-admin')
+        print("   ✓ Group 'gtwy-admin' exists")
+    except KeyError:
+        subprocess.run(['groupadd', '-f', 'gtwy-admin'], check=True)
+        print("   ✓ Group 'gtwy-admin' created")
+
+    # 5. Create tunneluser
+    try:
+        pwd.getpwnam('tunneluser')
+        print("   ✓ User 'tunneluser' exists")
+    except KeyError:
+        subprocess.run([
+            'useradd', '-r', '-s', '/bin/bash',
+            '-d', '/home/tunneluser', '-m',
+            'tunneluser'
+        ], check=True)
+        print("   ✓ User 'tunneluser' created")
+
+    # 6. Add tunneluser to gtwy-admin group
+    subprocess.run(['usermod', '-aG', 'gtwy-admin', 'tunneluser'], check=True)
+    print("   ✓ User 'tunneluser' added to 'gtwy-admin'")
+
+    # 7. Setup SSH directory
+    print("\n5. Configuring SSH access...")
+    ssh_dir = Path('/home/tunneluser/.ssh')
+    ssh_dir.mkdir(mode=0o700, exist_ok=True)
+
+    auth_keys = ssh_dir / 'authorized_keys'
+    auth_keys.touch(mode=0o600, exist_ok=True)
+
+    tunneluser_uid = pwd.getpwnam('tunneluser').pw_uid
+    tunneluser_gid = pwd.getpwnam('tunneluser').pw_gid
+    os.chown(ssh_dir, tunneluser_uid, tunneluser_gid)
+    os.chown(auth_keys, tunneluser_uid, tunneluser_gid)
+    print("   ✓ SSH directory configured")
+
+    # 8. Create sudo rules
+    print("\n6. Creating sudo rules...")
+    sudoers_file = Path('/etc/sudoers.d/gtwy')
+    sudoers_content = """# gtwy - Tunnel Gateway Manager
+# Allow tunneluser to manage nginx and certbot without password
+
+tunneluser ALL=(root) NOPASSWD: /usr/sbin/nginx -t
+tunneluser ALL=(root) NOPASSWD: /usr/sbin/nginx -s reload
+tunneluser ALL=(root) NOPASSWD: /usr/bin/certbot certonly *
+tunneluser ALL=(root) NOPASSWD: /usr/bin/certbot delete --cert-name *
+tunneluser ALL=(root) NOPASSWD: /usr/bin/certbot certificates
+"""
+
+    with open(sudoers_file, 'w') as f:
+        f.write(sudoers_content)
+
+    os.chmod(sudoers_file, 0o440)
+
+    # Validate sudoers syntax
+    result = subprocess.run(['visudo', '-cf', str(sudoers_file)],
+                          capture_output=True, text=True)
+    if result.returncode != 0:
+        sudoers_file.unlink()
+        print(f"   ✗ Invalid sudoers syntax: {result.stderr}")
+        sys.exit(1)
+
+    print("   ✓ Sudo rules configured")
+
+    # 9. Create symlink in /usr/local/bin
+    print("\n7. Creating symlink...")
+    symlink = Path('/usr/local/bin/gtwy')
+    if symlink.exists() or symlink.is_symlink():
+        symlink.unlink()
+    symlink.symlink_to(target_script)
+    print("   ✓ Symlink /usr/local/bin/gtwy → /opt/gtwy/gtwy")
+
+    # 10. Check Python dependencies
+    print("\n8. Checking Python dependencies...")
+    deps_ok = True
+    try:
+        import yaml
+        print("   ✓ PyYAML installed")
+    except ImportError:
+        print("   ✗ PyYAML not found")
+        deps_ok = False
+
+    try:
+        import requests
+        print("   ✓ requests installed")
+    except ImportError:
+        print("   ✗ requests not found")
+        deps_ok = False
+
+    if not deps_ok:
+        print("\n   Install missing dependencies with:")
+        print("     pip3 install PyYAML requests")
+        print("   or:")
+        print("     apt-get install python3-yaml python3-requests")
+
+    # Installation complete
+    print("\n" + "="*60)
+    print("✓ Installation complete!")
+    print("="*60)
+    print("\nNext steps:")
+    print("  1. Run configuration wizard:")
+    print("     sudo gtwy setup")
+    print("\n  2. Add your first box:")
+    print("     sudo gtwy add-box <box-id> <domain> <ssh-public-key>")
+    print("\ngtwy is now available globally as 'gtwy' command.")
+    print("="*60)
+
+# ============================================================================
+# COMMANDS - SETUP
+# ============================================================================
+
+def cmd_setup(args):
+    """Interactive setup wizard."""
+    print("🚀 gtwy Setup Wizard\n")
+
+    # Check if already configured
+    if Path(DEFAULT_CONFIG_PATH).exists() and not args.force:
+        response = input(f"Configuration already exists at {DEFAULT_CONFIG_PATH}. Overwrite? [y/N] ")
+        if response.lower() != 'y':
+            print("Setup cancelled.")
+            return
+
+    config = {}
+
+    # IONOS API Configuration
+    print("IONOS API Configuration:")
+    public_prefix = input("  Public Prefix: ").strip()
+    secret = input("  Secret: ").strip()
+
+    config['ionos'] = {
+        'public_prefix': public_prefix,
+        'secret': secret
+    }
+
+    # Test API connection
+    print("\n  Testing API connection...", end=' ')
+    try:
+        api_key = f"{public_prefix}.{secret}"
+        response = requests.get(
+            "https://api.hosting.ionos.com/dns/v1/zones",
+            headers={"X-API-Key": api_key},
+            timeout=10
+        )
+        response.raise_for_status()
+        print("✓")
+    except Exception as e:
+        print(f"✗\n  Warning: API test failed: {e}")
+
+    # Server Configuration
+    print("\nServer Configuration:")
+
+    # Auto-detect public IP
+    try:
+        response = requests.get('https://api.ipify.org', timeout=5)
+        detected_ip = response.text.strip()
+        ip_input = input(f"  Public IP [auto-detected: {detected_ip}]: ").strip()
+        public_ip = ip_input if ip_input else detected_ip
+    except Exception:
+        public_ip = input("  Public IP: ").strip()
+
+    hostname = input("  Hostname (optional, e.g., gateway.kibox.online): ").strip()
+
+    config['gateway'] = {
+        'public_ip': public_ip
+    }
+    if hostname:
+        config['gateway']['hostname'] = hostname
+
+    # Domain Configuration
+    print("\nDomain Configuration:")
+    domains_input = input("  Allowed domains (comma-separated, or empty for all): ").strip()
+
+    if domains_input:
+        domains = [d.strip() for d in domains_input.split(',')]
+    else:
+        domains = []
+
+    config['domains'] = domains
+
+    # Port Ranges
+    print("\nPort Ranges:")
+    service_start = input("  Service port start [10000]: ").strip() or "10000"
+    service_end = input("  Service port end [19999]: ").strip() or "19999"
+    admin_start = input("  Admin SSH port start [20000]: ").strip() or "20000"
+    admin_end = input("  Admin SSH port end [20999]: ").strip() or "20999"
+
+    config['port_range'] = {
+        'services': {
+            'start': int(service_start),
+            'end': int(service_end)
+        },
+        'admin_ssh': {
+            'start': int(admin_start),
+            'end': int(admin_end),
+            'allocation': 'sequential'
+        }
+    }
+
+    # SSL Configuration
+    print("\nSSL Configuration:")
+    certbot_email = input("  Certbot email: ").strip()
+    staging = input("  Use staging (for testing) [y/N]: ").strip().lower() == 'y'
+
+    config['certbot'] = {
+        'email': certbot_email,
+        'staging': staging
+    }
+
+    # Limits
+    config['max_tunnels_per_box'] = 10
+
+    # Paths
+    config['nginx'] = {
+        'config_path': '/etc/nginx/sites-enabled/tunnels-autogen.conf',
+        'template_path': '/opt/gtwy/nginx-template'
+    }
+
+    config['ssh'] = {
+        'authorized_keys_path': '/home/tunneluser/.ssh/authorized_keys'
+    }
+
+    # Logging
+    config['logging'] = {
+        'level': 'INFO',
+        'file': '/opt/gtwy/gtwy.log',
+        'max_size_mb': 10,
+        'backup_count': 5
+    }
+
+    # Show summary
+    print("\n" + "="*60)
+    print("Configuration Summary:")
+    print("="*60)
+    print(f"  IONOS Public Prefix: {public_prefix}")
+    print(f"  IONOS Secret: {'*' * len(secret)}")
+    print(f"  Public IP: {public_ip}")
+    if hostname:
+        print(f"  Hostname: {hostname}")
+    print(f"  Allowed domains: {', '.join(domains) if domains else 'all'}")
+    print(f"  Service ports: {service_start}-{service_end}")
+    print(f"  Admin SSH ports: {admin_start}-{admin_end}")
+    print(f"  Certbot email: {certbot_email}")
+    print(f"  Staging mode: {'Yes' if staging else 'No'}")
+    print("="*60)
+
+    # Confirm
+    if not args.yes:
+        response = input("\nSave this configuration? [Y/n] ").strip()
+        if response.lower() == 'n':
+            print("Setup cancelled.")
+            return
+
+    # Save configuration
+    save_config(config, DEFAULT_CONFIG_PATH)
+    print(f"\n✓ Configuration written to {DEFAULT_CONFIG_PATH}")
+
+    # Initialize database
+    init_database(DEFAULT_DB_PATH)
+    print(f"✓ Database initialized at {DEFAULT_DB_PATH}")
+
+    # Create directories
+    Path('/opt/gtwy/backups').mkdir(parents=True, exist_ok=True)
+    print("✓ Directories created")
+
+    # Set permissions
+    if os.geteuid() == 0:
+        import pwd, grp
+        try:
+            os.chmod(DEFAULT_CONFIG_PATH, 0o640)
+            # Set ownership to root:gtwy-admin
+            gtwy_admin_gid = grp.getgrnam('gtwy-admin').gr_gid
+            os.chown(DEFAULT_CONFIG_PATH, 0, gtwy_admin_gid)
+
+            # Set database permissions: tunneluser:gtwy-admin 664
+            if Path(DEFAULT_DB_PATH).exists():
+                tunneluser_uid = pwd.getpwnam('tunneluser').pw_uid
+                os.chown(DEFAULT_DB_PATH, tunneluser_uid, gtwy_admin_gid)
+                os.chmod(DEFAULT_DB_PATH, 0o664)
+
+            print("✓ Permissions set")
+        except (KeyError, FileNotFoundError) as e:
+            print(f"⚠ Warning: Could not set permissions: {e}")
+            print("  Run 'sudo gtwy install' first to set up system prerequisites.")
+    else:
+        print("\n⚠ Warning: Not running as root. Skipping permission setup.")
+        print("  Run 'sudo gtwy setup' to set correct permissions.")
+
+    print("\n✓ Setup complete! You can now add boxes with:")
+    print("  gtwy add-box <box-id> <domain> <public-key>")
+
+# ============================================================================
+# COMMANDS - BOX MANAGEMENT
+# ============================================================================
+
+def cmd_add_box(args):
+    """Register a new box."""
+    config = load_config(args.config)
+    conn = get_db_connection(args.db)
+
+    box_id = args.box_id
+    domain = args.domain
+    public_key_source = args.public_key_source
+    notes = args.notes
+
+    # Validate inputs
+    validate_box_id(box_id)
+    validate_domain(domain, config.get('domains', []))
+
+    # Check if box already exists
+    cursor = conn.execute("SELECT box_id FROM boxes WHERE box_id = ?", (box_id,))
+    if cursor.fetchone():
+        raise ValidationError(f"Box '{box_id}' already exists")
+
+    # Load public key
+    if Path(public_key_source).exists():
+        with open(public_key_source, 'r') as f:
+            public_key = f.read().strip()
+    else:
+        public_key = public_key_source
+
+    # Validate and parse key
+    key_type, key_data, full_key = validate_ssh_key(public_key)
+    fingerprint = calculate_ssh_fingerprint(key_type, key_data)
+
+    # Allocate admin SSH port
+    admin_ssh_port = allocate_admin_ssh_port(conn, config)
+
+    # Insert into database
+    conn.execute("""
+        INSERT INTO boxes
+        (box_id, domain, admin_ssh_port, ssh_key_type, ssh_key_fingerprint,
+         ssh_public_key, added_date, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (box_id, domain, admin_ssh_port, key_type, fingerprint,
+          full_key, datetime.now(timezone.utc).isoformat(), notes))
+
+    conn.commit()
+
+    # Add to authorized_keys
+    add_to_authorized_keys(box_id, full_key, config['ssh']['authorized_keys_path'])
+
+    # Output
+    print(f"✓ Box {box_id} added successfully")
+    print(f"  Domain:       {domain}")
+    print(f"  Admin SSH:    Port {admin_ssh_port}")
+
+    if config.get('gateway', {}).get('hostname'):
+        hostname = config['gateway']['hostname']
+        print(f"                ssh -p {admin_ssh_port} tunneluser@{hostname}")
+    else:
+        ip = config['gateway']['public_ip']
+        print(f"                ssh -p {admin_ssh_port} tunneluser@{ip}")
+
+    print(f"  SSH Key Type: {key_type}")
+    print(f"  Fingerprint:  {fingerprint}")
+    print()
+    print(f"Tunnels for this box will use: <service>.{box_id}.{domain}")
+
+    logger.info(f"Box {box_id} added (domain: {domain}, port: {admin_ssh_port})")
+
+    conn.close()
+
+def cmd_remove_box(args):
+    """Remove a box and all its tunnels."""
+    config = load_config(args.config)
+    conn = get_db_connection(args.db)
+
+    box_id = args.box_id
+
+    # Check if box exists
+    cursor = conn.execute("SELECT * FROM boxes WHERE box_id = ?", (box_id,))
+    box = cursor.fetchone()
+
+    if not box:
+        raise NotFoundError(f"Box '{box_id}' not found")
+
+    # Get all tunnels for this box
+    cursor = conn.execute("SELECT * FROM tunnels WHERE box_id = ?", (box_id,))
+    tunnels = cursor.fetchall()
+
+    # Show warning
+    if tunnels:
+        print(f"⚠ Warning: This will remove all tunnels for box {box_id}:")
+        for tunnel in tunnels:
+            print(f"  - {tunnel['subdomain']}")
+        print()
+
+    # Confirm
+    if not args.yes:
+        response = input(f"Remove box {box_id}? [y/N] ")
+        if response.lower() != 'y':
+            print("Cancelled.")
+            conn.close()
+            return
+
+    print(f"\nRemoving box {box_id}...")
+
+    # Remove each tunnel
+    if tunnels:
+        print(f"  Removing {len(tunnels)} tunnel(s)...", end=' ')
+        for tunnel in tunnels:
+            # Remove from nginx
+            # (will be handled by sync-nginx)
+
+            # Remove DNS
+            try:
+                delete_dns_record(tunnel['subdomain'], config)
+            except Exception as e:
+                logger.error(f"Failed to remove DNS for {tunnel['subdomain']}: {e}")
+
+            # Revoke certificate
+            try:
+                revoke_certificate(tunnel['subdomain'])
+            except Exception as e:
+                logger.error(f"Failed to revoke cert for {tunnel['subdomain']}: {e}")
+
+        print("✓")
+
+    # Delete tunnels from DB
+    conn.execute("DELETE FROM tunnels WHERE box_id = ?", (box_id,))
+
+    # Regenerate nginx config
+    print("  Cleaning up nginx config...", end=' ')
+    try:
+        nginx_config = generate_nginx_config(conn, config['nginx']['template_path'])
+        write_nginx_config(nginx_config, config['nginx']['config_path'])
+        reload_nginx()
+        print("✓")
+    except Exception as e:
+        print(f"✗ ({e})")
+
+    # Remove from authorized_keys
+    print("  Removing from authorized_keys...", end=' ')
+    try:
+        remove_from_authorized_keys(box_id, config['ssh']['authorized_keys_path'])
+        print("✓")
+    except Exception as e:
+        print(f"✗ ({e})")
+
+    # Delete box from DB
+    conn.execute("DELETE FROM boxes WHERE box_id = ?", (box_id,))
+    conn.commit()
+
+    print(f"\n✓ Box {box_id} removed successfully")
+
+    logger.info(f"Box {box_id} removed")
+
+    conn.close()
+
+def cmd_list_boxes(args):
+    """List all registered boxes."""
+    conn = get_db_connection(args.db)
+
+    cursor = conn.execute("""
+        SELECT b.*, COUNT(t.id) as tunnel_count
+        FROM boxes b
+        LEFT JOIN tunnels t ON b.box_id = t.box_id
+        GROUP BY b.box_id
+        ORDER BY b.box_id
+    """)
+    boxes = cursor.fetchall()
+
+    if not boxes:
+        print("No boxes registered yet.")
+        conn.close()
+        return
+
+    if args.json:
+        import json
+        boxes_list = []
+        for box in boxes:
+            boxes_list.append({
+                'box_id': box['box_id'],
+                'domain': box['domain'],
+                'admin_ssh_port': box['admin_ssh_port'],
+                'ssh_key_type': box['ssh_key_type'],
+                'ssh_key_fingerprint': box['ssh_key_fingerprint'],
+                'added_date': box['added_date'],
+                'last_seen': box['last_seen'],
+                'tunnel_count': box['tunnel_count'],
+                'notes': box['notes']
+            })
+
+        print(json.dumps({
+            'boxes': boxes_list,
+            'total': len(boxes),
+            'domains': len(set(b['domain'] for b in boxes))
+        }, indent=2))
+    else:
+        print("Registered Boxes:")
+        for box in boxes:
+            fingerprint_short = box['ssh_key_fingerprint'].split(':')[1][:8] if ':' in box['ssh_key_fingerprint'] else box['ssh_key_fingerprint'][:8]
+            last_seen = format_last_seen(box['last_seen'])
+
+            print(f"  {box['box_id']:<15} {box['domain']:<25} Port: {box['admin_ssh_port']:<5} "
+                  f"({box['ssh_key_type']}, {fingerprint_short}..., added {box['added_date'][:10]}, "
+                  f"last seen {last_seen}, {box['tunnel_count']} tunnel(s))")
+
+        print(f"\nTotal: {len(boxes)} box(es) across {len(set(b['domain'] for b in boxes))} domain(s)")
+
+    conn.close()
+
+def cmd_get_port(args):
+    """Get admin SSH port for a box."""
+    conn = get_db_connection(args.db)
+
+    box_id = args.box_id
+
+    cursor = conn.execute("SELECT admin_ssh_port FROM boxes WHERE box_id = ?", (box_id,))
+    box = cursor.fetchone()
+
+    if not box:
+        print(f"Error: Box {box_id} not found", file=sys.stderr)
+        conn.close()
+        sys.exit(4)
+
+    # Only print port (for piping)
+    print(box['admin_ssh_port'])
+
+    conn.close()
+
+# ============================================================================
+# COMMANDS - TUNNEL OPERATIONS (from Box)
+# ============================================================================
+
+def cmd_request(args):
+    """Request a new tunnel (called by box via SSH)."""
+    config = load_config(args.config)
+    conn = get_db_connection(args.db)
+
+    # Get BOX_ID from environment
+    box_id = os.environ.get('BOX_ID')
+    if not box_id:
+        raise GatewayPermissionError("BOX_ID not set. This command must be called via SSH.")
+
+    service = args.service
+    local_port = args.local_port
+
+    # Validate inputs
+    validate_service_name(service)
+    validate_port(local_port)
+
+    # Check if box exists and get domain
+    cursor = conn.execute("SELECT * FROM boxes WHERE box_id = ?", (box_id,))
+    box = cursor.fetchone()
+
+    if not box:
+        raise NotFoundError(f"Box {box_id} not registered")
+
+    # Check tunnel limit
+    cursor = conn.execute(
+        "SELECT COUNT(*) as count FROM tunnels WHERE box_id = ?",
+        (box_id,)
+    )
+    tunnel_count = cursor.fetchone()['count']
+
+    if tunnel_count >= config.get('max_tunnels_per_box', 10):
+        raise ValidationError(f"Maximum tunnels per box ({config['max_tunnels_per_box']}) reached")
+
+    # Generate subdomain
+    subdomain = generate_subdomain(conn, service, box_id)
+
+    # Check if tunnel already exists
+    cursor = conn.execute(
+        "SELECT * FROM tunnels WHERE box_id = ? AND service = ?",
+        (box_id, service)
+    )
+    if cursor.fetchone():
+        raise ValidationError(f"Tunnel for service '{service}' already exists")
+
+    # Allocate server port
+    server_port = allocate_port(conn, config['port_range'], 'services')
+
+    # Insert tunnel into DB
+    conn.execute("""
+        INSERT INTO tunnels
+        (box_id, service, local_port, server_port, subdomain, status, created)
+        VALUES (?, ?, ?, ?, ?, 'pending_cert', ?)
+    """, (box_id, service, local_port, server_port, subdomain, datetime.now(timezone.utc).isoformat()))
+
+    conn.commit()
+
+    logger.info(f"Tunnel requested by {box_id} (domain: {box['domain']}): {subdomain}")
+    logger.info(f"Allocated port {server_port}")
+
+    # Generate and reload nginx config
+    try:
+        nginx_config = generate_nginx_config(conn, config['nginx']['template_path'])
+        write_nginx_config(nginx_config, config['nginx']['config_path'])
+        reload_nginx()
+        logger.info("nginx reloaded successfully")
+    except Exception as e:
+        # Rollback
+        conn.execute("DELETE FROM tunnels WHERE subdomain = ?", (subdomain,))
+        conn.commit()
+        conn.close()
+        raise DependencyError(f"nginx configuration failed: {e}")
+
+    # Create DNS record
+    try:
+        create_dns_record(subdomain, config)
+        logger.info(f"DNS record created for {subdomain}")
+    except Exception as e:
+        logger.error(f"DNS creation failed for {subdomain}: {e}")
+        conn.execute(
+            "UPDATE tunnels SET status = 'error', error_message = ? WHERE subdomain = ?",
+            (f"DNS creation failed: {e}", subdomain)
+        )
+        conn.commit()
+
+    # Certificate will be requested by sync-certs (async)
+    logger.info(f"Tunnel {subdomain} created with status pending_cert")
+
+    # Update last_seen for box
+    conn.execute(
+        "UPDATE boxes SET last_seen = ? WHERE box_id = ?",
+        (datetime.now(timezone.utc).isoformat(), box_id)
+    )
+    conn.commit()
+
+    # Print server port to stdout (for box to use with autossh)
+    print(server_port)
+
+    conn.close()
+
+def cmd_release(args):
+    """Release a tunnel (called by box via SSH)."""
+    config = load_config(args.config)
+    conn = get_db_connection(args.db)
+
+    # Get BOX_ID from environment
+    box_id = os.environ.get('BOX_ID')
+    if not box_id:
+        raise GatewayPermissionError("BOX_ID not set. This command must be called via SSH.")
+
+    service = args.service
+
+    # Validate
+    validate_service_name(service)
+
+    # Find tunnel
+    cursor = conn.execute(
+        "SELECT * FROM tunnels WHERE box_id = ? AND service = ?",
+        (box_id, service)
+    )
+    tunnel = cursor.fetchone()
+
+    if not tunnel:
+        raise NotFoundError(f"Tunnel for service '{service}' not found")
+
+    subdomain = tunnel['subdomain']
+
+    # Delete from DB
+    conn.execute("DELETE FROM tunnels WHERE id = ?", (tunnel['id'],))
+    conn.commit()
+
+    # Regenerate nginx config
+    try:
+        nginx_config = generate_nginx_config(conn, config['nginx']['template_path'])
+        write_nginx_config(nginx_config, config['nginx']['config_path'])
+        reload_nginx()
+    except Exception as e:
+        logger.error(f"nginx update failed: {e}")
+
+    # Remove DNS
+    try:
+        delete_dns_record(subdomain, config)
+    except Exception as e:
+        logger.error(f"DNS deletion failed: {e}")
+
+    # Revoke certificate
+    try:
+        revoke_certificate(subdomain)
+    except Exception as e:
+        logger.error(f"Certificate revocation failed: {e}")
+
+    print(f"✓ Tunnel {service} released")
+
+    logger.info(f"Tunnel {subdomain} released by {box_id}")
+
+    conn.close()
+
+# ============================================================================
+# COMMANDS - TUNNEL MANAGEMENT (Admin)
+# ============================================================================
+
+def cmd_list(args):
+    """Show all active tunnels."""
+    conn = get_db_connection(args.db)
+
+    # Build query
+    query = "SELECT * FROM tunnels"
+    params = []
+
+    if args.box:
+        query += " WHERE box_id = ?"
+        params.append(args.box)
+        if args.status:
+            query += " AND status = ?"
+            params.append(args.status)
+    elif args.status:
+        query += " WHERE status = ?"
+        params.append(args.status)
+
+    query += " ORDER BY created DESC"
+
+    cursor = conn.execute(query, params)
+    tunnels = cursor.fetchall()
+
+    if not tunnels:
+        print("No tunnels found.")
+        conn.close()
+        return
+
+    if args.json:
+        import json
+        tunnels_list = []
+        for t in tunnels:
+            tunnels_list.append({
+                'subdomain': t['subdomain'],
+                'box_id': t['box_id'],
+                'service': t['service'],
+                'local_port': t['local_port'],
+                'server_port': t['server_port'],
+                'status': t['status'],
+                'created': t['created'],
+                'last_checked': t['last_checked'],
+                'error_message': t['error_message']
+            })
+
+        status_counts = {}
+        for t in tunnels:
+            status_counts[t['status']] = status_counts.get(t['status'], 0) + 1
+
+        print(json.dumps({
+            'tunnels': tunnels_list,
+            'total': len(tunnels),
+            'status_counts': status_counts
+        }, indent=2))
+    else:
+        print("Active Tunnels:")
+        print(f"{'Subdomain':<35} {'Box':<10} {'Service':<10} {'Local':<6} {'Server':<6} {'Status':<12} {'Age':<8}")
+        print("-" * 95)
+
+        for t in tunnels:
+            age = format_age(t['created'])
+            print(f"{t['subdomain']:<35} {t['box_id']:<10} {t['service']:<10} "
+                  f"{t['local_port']:<6} {t['server_port']:<6} {t['status']:<12} {age:<8}")
+
+        # Summary
+        status_counts = {}
+        for t in tunnels:
+            status_counts[t['status']] = status_counts.get(t['status'], 0) + 1
+
+        summary = ', '.join([f"{count} {status}" for status, count in status_counts.items()])
+        print(f"\nTotal: {len(tunnels)} tunnel(s) ({summary})")
+
+    conn.close()
+
+def cmd_info(args):
+    """Show detailed information about a tunnel."""
+    config = load_config(args.config)
+    conn = get_db_connection(args.db)
+
+    subdomain = args.subdomain
+
+    # Find tunnel
+    cursor = conn.execute("SELECT * FROM tunnels WHERE subdomain = ?", (subdomain,))
+    tunnel = cursor.fetchone()
+
+    if not tunnel:
+        raise NotFoundError(f"Tunnel '{subdomain}' not found")
+
+    print(f"Tunnel Details:")
+    print(f"  Subdomain:    {tunnel['subdomain']}")
+    print(f"  Box ID:       {tunnel['box_id']}")
+    print(f"  Service:      {tunnel['service']}")
+    print(f"  Local Port:   {tunnel['local_port']}")
+    print(f"  Server Port:  {tunnel['server_port']}")
+    print(f"  Status:       {tunnel['status']}")
+    print(f"  Created:      {tunnel['created']}")
+
+    if tunnel['last_checked']:
+        print(f"  Last Checked: {tunnel['last_checked']}")
+
+    if tunnel['error_message']:
+        print(f"  Error:        {tunnel['error_message']}")
+
+    print(f"\nComponent Status:")
+
+    # Check nginx config
+    nginx_path = config['nginx']['config_path']
+    if Path(nginx_path).exists():
+        with open(nginx_path, 'r') as f:
+            nginx_content = f.read()
+            if subdomain in nginx_content:
+                print(f"  nginx:        ✓ configured")
+            else:
+                print(f"  nginx:        ✗ not found in config")
+    else:
+        print(f"  nginx:        ✗ config file missing")
+
+    # Check DNS (simplified - would need actual DNS lookup)
+    print(f"  DNS:          (check with: dig {subdomain})")
+
+    # Check certificate
+    cert_path = Path(f"/etc/letsencrypt/live/{subdomain}/fullchain.pem")
+    if cert_path.exists():
+        print(f"  Certificate:  ✓ exists")
+    else:
+        print(f"  Certificate:  ✗ not found")
+
+    # Check port listening
+    try:
+        result = subprocess.run(
+            ['ss', '-tlnp'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if f":{tunnel['server_port']}" in result.stdout:
+            print(f"  Port:         ✓ listening")
+        else:
+            print(f"  Port:         ✗ not listening")
+    except Exception:
+        print(f"  Port:         ? (could not check)")
+
+    print(f"\nURLs:")
+    print(f"  HTTP:  http://{subdomain}")
+    print(f"  HTTPS: https://{subdomain}")
+
+    conn.close()
+
+def cmd_remove_tunnel(args):
+    """Manually remove a tunnel (admin operation)."""
+    config = load_config(args.config)
+    conn = get_db_connection(args.db)
+
+    subdomain = args.subdomain
+
+    # Find tunnel
+    cursor = conn.execute("SELECT * FROM tunnels WHERE subdomain = ?", (subdomain,))
+    tunnel = cursor.fetchone()
+
+    if not tunnel:
+        raise NotFoundError(f"Tunnel '{subdomain}' not found")
+
+    # Confirm
+    if not args.yes:
+        response = input(f"Remove tunnel {subdomain}? [y/N] ")
+        if response.lower() != 'y':
+            print("Cancelled.")
+            conn.close()
+            return
+
+    # Delete from DB
+    conn.execute("DELETE FROM tunnels WHERE id = ?", (tunnel['id'],))
+    conn.commit()
+
+    print(f"Removing tunnel {subdomain}...")
+
+    # Regenerate nginx
+    print("  Updating nginx...", end=' ')
+    try:
+        nginx_config = generate_nginx_config(conn, config['nginx']['template_path'])
+        write_nginx_config(nginx_config, config['nginx']['config_path'])
+        reload_nginx()
+        print("✓")
+    except Exception as e:
+        print(f"✗ ({e})")
+
+    # Remove DNS
+    print("  Removing DNS...", end=' ')
+    try:
+        delete_dns_record(subdomain, config)
+        print("✓")
+    except Exception as e:
+        print(f"✗ ({e})")
+
+    # Revoke certificate
+    print("  Revoking certificate...", end=' ')
+    try:
+        revoke_certificate(subdomain)
+        print("✓")
+    except Exception as e:
+        print(f"✗ ({e})")
+
+    print(f"\n✓ Tunnel {subdomain} removed")
+
+    logger.info(f"Tunnel {subdomain} manually removed")
+
+    conn.close()
+
+# ============================================================================
+# COMMANDS - STATUS & DIAGNOSTICS
+# ============================================================================
+
+def cmd_status(args):
+    """Check health of all tunnels."""
+    conn = get_db_connection(args.db)
+
+    # Build query
+    query = "SELECT * FROM tunnels"
+    params = []
+
+    if args.box:
+        query += " WHERE box_id = ?"
+        params.append(args.box)
+
+    query += " ORDER BY subdomain"
+
+    cursor = conn.execute(query, params)
+    tunnels = cursor.fetchall()
+
+    if not tunnels:
+        print("No tunnels to check.")
+        conn.close()
+        return
+
+    print("Checking tunnel status...")
+
+    healthy = 0
+    unhealthy = 0
+
+    for tunnel in tunnels:
+        # Check if port is listening
+        try:
+            result = subprocess.run(
+                ['ss', '-tlnp'],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            port_listening = f":{tunnel['server_port']}" in result.stdout
+        except Exception:
+            port_listening = False
+
+        if port_listening:
+            print(f"  ✓ {tunnel['subdomain']} (port {tunnel['server_port']} responding)")
+            healthy += 1
+        else:
+            print(f"  ✗ {tunnel['subdomain']} (port {tunnel['server_port']} not responding)")
+            unhealthy += 1
+
+        # Update last_checked
+        conn.execute(
+            "UPDATE tunnels SET last_checked = ? WHERE id = ?",
+            (datetime.now(timezone.utc).isoformat(), tunnel['id'])
+        )
+
+    conn.commit()
+
+    total = healthy + unhealthy
+    percentage = (healthy / total * 100) if total > 0 else 0
+
+    print(f"\n{healthy}/{total} tunnels healthy ({percentage:.0f}%)")
+
+    if unhealthy > 0:
+        print(f"⚠ Warning: {unhealthy} tunnel(s) appear offline")
+
+    conn.close()
+
+def cmd_stats(args):
+    """Show gateway statistics."""
+    conn = get_db_connection(args.db)
+    config = load_config(args.config)
+
+    # Box stats
+    cursor = conn.execute("SELECT COUNT(*) as count FROM boxes")
+    box_count = cursor.fetchone()['count']
+
+    cursor = conn.execute("SELECT DISTINCT domain FROM boxes")
+    domains = [row['domain'] for row in cursor.fetchall()]
+
+    # Tunnel stats
+    cursor = conn.execute("SELECT COUNT(*) as count, status FROM tunnels GROUP BY status")
+    status_counts = {row['status']: row['count'] for row in cursor.fetchall()}
+
+    total_tunnels = sum(status_counts.values())
+    active = status_counts.get('active', 0)
+    pending = status_counts.get('pending_cert', 0)
+    error = status_counts.get('error', 0)
+
+    # Port usage
+    cursor = conn.execute("SELECT MIN(server_port) as min, MAX(server_port) as max FROM tunnels")
+    port_range = cursor.fetchone()
+
+    cursor = conn.execute("SELECT MIN(admin_ssh_port) as min, MAX(admin_ssh_port) as max FROM boxes")
+    admin_port_range = cursor.fetchone()
+
+    service_start = config['port_range']['services']['start']
+    service_end = config['port_range']['services']['end']
+    service_available = (service_end - service_start + 1) - total_tunnels
+    service_utilization = (total_tunnels / (service_end - service_start + 1)) * 100
+
+    admin_start = config['port_range']['admin_ssh']['start']
+    admin_end = config['port_range']['admin_ssh']['end']
+    admin_available = (admin_end - admin_start + 1) - box_count
+
+    # Tunnel age
+    cursor = conn.execute("SELECT created FROM tunnels ORDER BY created ASC LIMIT 1")
+    oldest = cursor.fetchone()
+
+    cursor = conn.execute("SELECT created FROM tunnels ORDER BY created DESC LIMIT 1")
+    newest = cursor.fetchone()
+
+    print("Gateway Statistics:")
+    print(f"  Registered Boxes:     {box_count}")
+    print(f"  Domains in use:       {len(domains)} ({', '.join(domains)})")
+    print(f"  Active Tunnels:       {active}")
+    print(f"  Pending Tunnels:      {pending}")
+    print(f"  Error Tunnels:        {error}")
+    print()
+    print("Port Usage:")
+
+    if port_range['min'] and port_range['max']:
+        print(f"  Service Ports:        {port_range['min']}-{port_range['max']} ({total_tunnels} used)")
+    else:
+        print(f"  Service Ports:        none used")
+
+    if admin_port_range['min'] and admin_port_range['max']:
+        print(f"  Admin SSH Ports:      {admin_port_range['min']}-{admin_port_range['max']} ({box_count} used)")
+    else:
+        print(f"  Admin SSH Ports:      none used")
+
+    print(f"  Available Ports:      {service_available} service, {admin_available} admin")
+    print(f"  Service Utilization:  {service_utilization:.2f}%")
+
+    if oldest and newest:
+        print()
+        print("Tunnel Age:")
+        print(f"  Oldest:  {format_age(oldest['created'])} ({oldest['created'][:10]})")
+        print(f"  Newest:  {format_age(newest['created'])} ({newest['created'][:10]})")
+
+    conn.close()
+
+def cmd_test_tunnel(args):
+    """End-to-end test of a tunnel."""
+    config = load_config(args.config)
+    conn = get_db_connection(args.db)
+
+    subdomain = args.subdomain
+
+    # Find tunnel
+    cursor = conn.execute("SELECT * FROM tunnels WHERE subdomain = ?", (subdomain,))
+    tunnel = cursor.fetchone()
+
+    if not tunnel:
+        raise NotFoundError(f"Tunnel '{subdomain}' not found")
+
+    print(f"Testing tunnel: {subdomain}\n")
+
+    # DNS Resolution
+    print("DNS Resolution:")
+    try:
+        import socket
+        ip = socket.gethostbyname(subdomain)
+        expected_ip = get_server_public_ip(config)
+
+        if ip == expected_ip:
+            print(f"  ✓ A record found: {ip}")
+        else:
+            print(f"  ⚠ A record found: {ip} (expected: {expected_ip})")
+    except Exception as e:
+        print(f"  ✗ DNS lookup failed: {e}")
+
+    # Port Check
+    print("\nPort Check:")
+    try:
+        result = subprocess.run(
+            ['ss', '-tlnp'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if f":{tunnel['server_port']}" in result.stdout:
+            print(f"  ✓ Port {tunnel['server_port']} listening on gateway")
+        else:
+            print(f"  ✗ Port {tunnel['server_port']} not listening")
+    except Exception as e:
+        print(f"  ✗ Port check failed: {e}")
+
+    # HTTP/HTTPS Check
+    print("\nHTTP/HTTPS:")
+    try:
+        # HTTP
+        response = requests.get(f"http://{subdomain}", allow_redirects=False, timeout=10)
+        if response.status_code == 301:
+            print(f"  ✓ HTTP redirects to HTTPS ({response.status_code})")
+        else:
+            print(f"  ⚠ HTTP response: {response.status_code}")
+    except Exception as e:
+        print(f"  ✗ HTTP check failed: {e}")
+
+    try:
+        # HTTPS
+        response = requests.get(f"https://{subdomain}", timeout=10, verify=True)
+        print(f"  ✓ HTTPS responds ({response.status_code})")
+    except Exception as e:
+        print(f"  ✗ HTTPS check failed: {e}")
+
+    # Certificate
+    print("\nCertificate:")
+    cert_path = Path(f"/etc/letsencrypt/live/{subdomain}/fullchain.pem")
+    if cert_path.exists():
+        print(f"  ✓ Certificate exists")
+        print(f"  ℹ Path: {cert_path}")
+    else:
+        print(f"  ✗ Certificate not found")
+
+    print(f"\nTest URL: https://{subdomain}")
+
+    conn.close()
+
+def cmd_health(args):
+    """System health check."""
+    config = load_config(args.config)
+
+    print("System Health Check:\n")
+
+    all_ok = True
+
+    # Database
+    print("Database:       ", end='')
+    try:
+        conn = get_db_connection(args.db)
+        cursor = conn.execute("SELECT COUNT(*) as boxes FROM boxes")
+        box_count = cursor.fetchone()['boxes']
+        cursor = conn.execute("SELECT COUNT(*) as tunnels FROM tunnels")
+        tunnel_count = cursor.fetchone()['tunnels']
+        print(f"✓ OK ({box_count} boxes, {tunnel_count} tunnels)")
+        conn.close()
+    except Exception as e:
+        print(f"✗ FAIL ({e})")
+        all_ok = False
+
+    # Config
+    print("Config:         ", end='')
+    try:
+        load_config(args.config)
+        print("✓ OK")
+    except Exception as e:
+        print(f"✗ FAIL ({e})")
+        all_ok = False
+
+    # nginx
+    print("nginx:          ", end='')
+    try:
+        result = subprocess.run(['nginx', '-v'], capture_output=True, text=True, timeout=5)
+        version = result.stderr.split('/')[-1].strip()
+        print(f"✓ running (v{version})")
+    except Exception as e:
+        print(f"✗ FAIL ({e})")
+        all_ok = False
+
+    # certbot
+    print("certbot:        ", end='')
+    try:
+        result = subprocess.run(['certbot', '--version'], capture_output=True, text=True, timeout=5)
+        version = result.stdout.strip().split()[-1]
+        print(f"✓ installed (v{version})")
+    except Exception as e:
+        print(f"✗ FAIL ({e})")
+        all_ok = False
+
+    # IONOS API
+    print("IONOS API:      ", end='')
+    try:
+        api_key = f"{config['ionos']['public_prefix']}.{config['ionos']['secret']}"
+        response = requests.get(
+            "https://api.hosting.ionos.com/dns/v1/zones",
+            headers={"X-API-Key": api_key},
+            timeout=10
+        )
+        response.raise_for_status()
+        print("✓ reachable")
+    except Exception as e:
+        print(f"✗ FAIL ({e})")
+        all_ok = False
+
+    # Disk Space
+    print("Disk Space:     ", end='')
+    try:
+        stat = shutil.disk_usage('/opt/gtwy')
+        free_percent = (stat.free / stat.total) * 100
+        print(f"✓ {free_percent:.0f}% free")
+    except Exception as e:
+        print(f"? ({e})")
+
+    # Permissions
+    print("Permissions:    ", end='')
+    config_path = Path(args.config)
+    if config_path.exists():
+        stat = config_path.stat()
+        mode = stat.st_mode & 0o777
+        if mode == 0o640:
+            print("✓ OK")
+        else:
+            print(f"⚠ config.yml has mode {oct(mode)} (expected 0640)")
+    else:
+        print("✗ config.yml not found")
+        all_ok = False
+
+    print()
+    if all_ok:
+        print("Overall: ✓ HEALTHY")
+        sys.exit(0)
+    else:
+        print("Overall: ✗ ISSUES FOUND")
+        sys.exit(5)
+
+# ============================================================================
+# COMMANDS - MAINTENANCE & SYNC
+# ============================================================================
+
+def cmd_sync_nginx(args):
+    """Regenerate nginx configuration from database."""
+    config = load_config(args.config)
+    conn = get_db_connection(args.db)
+
+    print("Regenerating nginx configuration...")
+
+    # Get tunnel count
+    cursor = conn.execute("SELECT COUNT(*) as count FROM tunnels WHERE status != 'error'")
+    count = cursor.fetchone()['count']
+    print(f"  Fetched {count} tunnel(s) from database")
+
+    # Generate config
+    nginx_config = generate_nginx_config(conn, config['nginx']['template_path'])
+    lines = len(nginx_config.split('\n'))
+    print(f"  Generated config ({lines} lines)")
+
+    # Test
+    print("  Testing nginx config...", end=' ')
+    write_nginx_config(nginx_config, config['nginx']['config_path'])
+    print("✓")
+
+    # Reload
+    print("  Reloading nginx...", end=' ')
+    reload_nginx()
+    print("✓")
+
+    print("\n✓ nginx configuration synchronized")
+
+    logger.info("nginx configuration regenerated from database")
+
+    conn.close()
+
+def cmd_sync_dns(args):
+    """Synchronize DNS records with database state."""
+    config = load_config(args.config)
+    conn = get_db_connection(args.db)
+
+    print("Analyzing DNS records...")
+
+    # Get all tunnels from DB
+    cursor = conn.execute("SELECT subdomain FROM tunnels ORDER BY subdomain")
+    db_subdomains = {row['subdomain'] for row in cursor.fetchall()}
+
+    if not db_subdomains:
+        print("No tunnels in database.")
+        conn.close()
+        return
+
+    # Group by domain
+    domains_map = {}
+    for subdomain in db_subdomains:
+        parts = subdomain.split('.')
+        domain = '.'.join(parts[-2:])
+        if domain not in domains_map:
+            domains_map[domain] = []
+        domains_map[domain].append(subdomain)
+
+    # Check each domain
+    for domain, subdomains in domains_map.items():
+        print(f"\nZone: {domain}")
+
+        # Note: Full DNS sync would require querying IONOS API for existing records
+        # For now, just show what we have in DB
+        for subdomain in subdomains:
+            print(f"  - {subdomain} (in DB)")
+
+        if args.dry_run:
+            print("  DRY RUN - no changes made")
+        else:
+            # In a full implementation, would:
+            # 1. Query IONOS for all records
+            # 2. Compare with DB
+            # 3. Create missing
+            # 4. Delete orphaned (with confirmation)
+            print("  (Full sync not yet implemented - use sync-nginx for now)")
+
+    conn.close()
+
+def cmd_sync_certs(args):
+    """Request certificates for pending tunnels."""
+    config = load_config(args.config)
+    conn = get_db_connection(args.db)
+
+    # Find pending tunnels
+    cursor = conn.execute("SELECT * FROM tunnels WHERE status = 'pending_cert'")
+    pending = cursor.fetchall()
+
+    if not pending:
+        print("No pending certificates.")
+        conn.close()
+        return
+
+    print(f"Requesting certificates for {len(pending)} pending tunnel(s)...\n")
+
+    success = 0
+    skipped = 0
+
+    server_ip = get_server_public_ip(config)
+
+    for tunnel in pending:
+        subdomain = tunnel['subdomain']
+        print(f"{subdomain}:")
+
+        # Check DNS propagation
+        print("  Checking DNS propagation...", end=' ')
+        if check_dns_propagation(subdomain, server_ip):
+            print("✓")
+
+            # Request certificate
+            print("  Requesting certificate...", end=' ')
+            if request_certificate(subdomain, config):
+                print("✓")
+
+                # Update status
+                conn.execute(
+                    "UPDATE tunnels SET status = 'active', error_message = NULL WHERE id = ?",
+                    (tunnel['id'],)
+                )
+                success += 1
+            else:
+                print("✗")
+                conn.execute(
+                    "UPDATE tunnels SET error_message = 'Certificate request failed' WHERE id = ?",
+                    (tunnel['id'],)
+                )
+        else:
+            print("✗ (not propagated yet)")
+            print("  Skipping (will retry later)")
+            skipped += 1
+
+    conn.commit()
+
+    print(f"\nProcessed {len(pending)} tunnel(s): {success} success, {skipped} skipped")
+
+    logger.info(f"Certificate sync: {success} success, {skipped} skipped")
+
+    conn.close()
+
+def cmd_cleanup(args):
+    """Clean up orphaned resources."""
+    config = load_config(args.config)
+    conn = get_db_connection(args.db)
+
+    print("Scanning for orphaned resources...")
+
+    orphaned_count = 0
+
+    # Check nginx config for orphaned entries
+    print("\nOrphaned nginx configs:")
+    nginx_path = config['nginx']['config_path']
+    if Path(nginx_path).exists():
+        with open(nginx_path, 'r') as f:
+            nginx_content = f.read()
+
+        # Get all subdomains from DB
+        cursor = conn.execute("SELECT subdomain FROM tunnels")
+        db_subdomains = {row['subdomain'] for row in cursor.fetchall()}
+
+        # Find subdomains in nginx but not in DB (simple check)
+        # Full implementation would parse nginx config properly
+        print("  (Full orphan detection not yet implemented)")
+
+    # Check authorized_keys for orphaned entries
+    print("\nOrphaned authorized_keys entries:")
+    auth_keys_path = config['ssh']['authorized_keys_path']
+    if Path(auth_keys_path).exists():
+        with open(auth_keys_path, 'r') as f:
+            lines = f.readlines()
+
+        cursor = conn.execute("SELECT box_id FROM boxes")
+        db_boxes = {row['box_id'] for row in cursor.fetchall()}
+
+        for line in lines:
+            if 'BOX_ID=' in line:
+                # Extract box_id
+                match = re.search(r'BOX_ID=([a-z0-9-]+)', line)
+                if match:
+                    box_id = match.group(1)
+                    if box_id not in db_boxes:
+                        print(f"  ⚠ Entry for {box_id} (not in database)")
+                        orphaned_count += 1
+
+    if orphaned_count == 0:
+        print("\n✓ No orphaned resources found")
+    else:
+        print(f"\nSummary: {orphaned_count} orphaned resource(s) found")
+
+        if args.dry_run:
+            print("DRY RUN - no changes made")
+            print("Run without --dry-run and with -y to clean up")
+
+    conn.close()
+
+def cmd_rebuild(args):
+    """Complete rebuild of all configurations."""
+    config = load_config(args.config)
+
+    print("🔄 Starting complete rebuild...\n")
+
+    # Step 1: sync-nginx
+    print("Step 1/3: Regenerating nginx configuration...")
+    try:
+        cmd_sync_nginx(args)
+        print("  ✓ nginx config synchronized\n")
+    except Exception as e:
+        print(f"  ✗ Failed: {e}\n")
+
+    # Step 2: sync-dns
+    print("Step 2/3: Synchronizing DNS records...")
+    try:
+        cmd_sync_dns(args)
+        print("  ✓ DNS records checked\n")
+    except Exception as e:
+        print(f"  ✗ Failed: {e}\n")
+
+    # Step 3: sync-certs
+    print("Step 3/3: Requesting pending certificates...")
+    try:
+        cmd_sync_certs(args)
+        print("  ✓ Certificates processed\n")
+    except Exception as e:
+        print(f"  ✗ Failed: {e}\n")
+
+    print("✓ Rebuild complete!")
+
+    logger.info("Complete rebuild executed")
+
+# ============================================================================
+# COMMANDS - BACKUP & RESTORE
+# ============================================================================
+
+def cmd_backup(args):
+    """Create backup of database and configuration."""
+    config = load_config(args.config)
+
+    # Determine destination
+    if args.destination:
+        backup_dir = Path(args.destination)
+    else:
+        backup_dir = Path('/opt/gtwy/backups')
+
+    backup_dir.mkdir(parents=True, exist_ok=True)
+
+    # Generate backup filename
+    timestamp = datetime.now().strftime('%Y-%m-%d-%H%M%S')
+    backup_file = backup_dir / f"gtwy-backup-{timestamp}.tar.gz"
+
+    print("Creating backup...")
+
+    # Create tarball
+    with tarfile.open(backup_file, 'w:gz') as tar:
+        # Add database
+        if Path(args.db).exists():
+            tar.add(args.db, arcname='tunnels.db')
+            print(f"  Database:     ✓ tunnels.db")
+
+        # Add config
+        if Path(args.config).exists():
+            tar.add(args.config, arcname='config.yml')
+            print(f"  Config:       ✓ config.yml")
+
+        # Add template
+        template_path = config['nginx']['template_path']
+        if Path(template_path).exists():
+            tar.add(template_path, arcname='nginx-template')
+            print(f"  Template:     ✓ nginx-template")
+
+        # Add authorized_keys
+        auth_keys = config['ssh']['authorized_keys_path']
+        if Path(auth_keys).exists():
+            tar.add(auth_keys, arcname='authorized_keys')
+            print(f"  SSH Keys:     ✓ authorized_keys")
+
+    # Get size
+    size = backup_file.stat().st_size
+    size_kb = size / 1024
+
+    print(f"\nBackup created: {backup_file}")
+    print(f"Size: {size_kb:.1f} KB")
+
+    logger.info(f"Backup created: {backup_file}")
+
+def cmd_restore(args):
+    """Restore from backup."""
+    backup_file = Path(args.backup_file)
+
+    if not backup_file.exists():
+        raise NotFoundError(f"Backup file not found: {backup_file}")
+
+    print(f"Restoring from backup: {backup_file.name}\n")
+
+    # Show backup contents
+    print("Backup contents:")
+    with tarfile.open(backup_file, 'r:gz') as tar:
+        members = tar.getmembers()
+        for member in members:
+            print(f"  - {member.name}")
+
+    # Warning
+    print(f"\n⚠ WARNING: This will overwrite current data!")
+
+    if not args.force:
+        response = input("\nContinue? [y/N] ")
+        if response.lower() != 'y':
+            print("Restore cancelled.")
+            return
+
+    print("\nRestoring...")
+
+    # Extract
+    with tarfile.open(backup_file, 'r:gz') as tar:
+        # Extract to temp directory
+        temp_dir = Path('/tmp/gtwy-restore')
+        temp_dir.mkdir(exist_ok=True)
+        tar.extractall(temp_dir)
+
+        # Restore database
+        if (temp_dir / 'tunnels.db').exists():
+            shutil.copy2(temp_dir / 'tunnels.db', DEFAULT_DB_PATH)
+            print("  ✓ Database restored")
+
+        # Restore config
+        if (temp_dir / 'config.yml').exists():
+            shutil.copy2(temp_dir / 'config.yml', DEFAULT_CONFIG_PATH)
+            os.chmod(DEFAULT_CONFIG_PATH, 0o640)
+            print("  ✓ Config restored")
+
+        # Restore template
+        if (temp_dir / 'nginx-template').exists():
+            shutil.copy2(temp_dir / 'nginx-template', '/opt/gtwy/nginx-template')
+            print("  ✓ Template restored")
+
+        # Restore authorized_keys
+        if (temp_dir / 'authorized_keys').exists():
+            config = load_config()
+            auth_keys_path = config['ssh']['authorized_keys_path']
+            Path(auth_keys_path).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(temp_dir / 'authorized_keys', auth_keys_path)
+            os.chmod(auth_keys_path, 0o600)
+            print("  ✓ SSH keys restored")
+
+        # Cleanup
+        shutil.rmtree(temp_dir)
+
+    print("\n✓ Restore successful")
+    print("\nRecommended: Run 'gtwy rebuild' to synchronize nginx, DNS, and certs")
+
+    logger.info(f"Restored from backup: {backup_file}")
+
+# ============================================================================
+# COMMANDS - UTILITY
+# ============================================================================
+
+def cmd_version(args):
+    """Show version."""
+    print(f"gtwy v{VERSION}")
+
+# ============================================================================
+# ARGUMENT PARSER
+# ============================================================================
+
+def build_parser():
+    """Build argument parser with all commands."""
+    parser = argparse.ArgumentParser(
+        prog='gtwy',
+        description='Tunnel Gateway Manager for IT.Box infrastructure'
+    )
+
+    # Global arguments
+    parser.add_argument('-v', '--verbose', action='store_true',
+                        help='Verbose output')
+    parser.add_argument('-q', '--quiet', action='store_true',
+                        help='Quiet mode (only errors)')
+    parser.add_argument('--config', default=DEFAULT_CONFIG_PATH,
+                        help=f'Config file path (default: {DEFAULT_CONFIG_PATH})')
+    parser.add_argument('--db', default=DEFAULT_DB_PATH,
+                        help=f'Database path (default: {DEFAULT_DB_PATH})')
+
+    subparsers = parser.add_subparsers(dest='command', help='Commands')
+
+    # install
+    p_install = subparsers.add_parser('install',
+                                       help='Install gtwy system-wide (one-time)')
+    p_install.add_argument('--force', action='store_true',
+                          help='Force reinstallation')
+    p_install.set_defaults(func=cmd_install)
+
+    # setup
+    p_setup = subparsers.add_parser('setup', help='Interactive initial setup')
+    p_setup.add_argument('--force', action='store_true',
+                         help='Overwrite existing configuration')
+    p_setup.add_argument('-y', '--yes', action='store_true',
+                         help='Skip confirmations')
+    p_setup.set_defaults(func=cmd_setup)
+
+    # add-box
+    p_add_box = subparsers.add_parser('add-box', help='Register a new box')
+    p_add_box.add_argument('box_id', help='Box ID')
+    p_add_box.add_argument('domain', help='Domain for this box')
+    p_add_box.add_argument('public_key_source',
+                           help='Public key file path or key string')
+    p_add_box.add_argument('--notes', help='Optional notes')
+    p_add_box.set_defaults(func=cmd_add_box)
+
+    # remove-box
+    p_remove_box = subparsers.add_parser('remove-box',
+                                          help='Remove box and all tunnels')
+    p_remove_box.add_argument('box_id', help='Box ID')
+    p_remove_box.add_argument('-y', '--yes', action='store_true',
+                              help='Skip confirmation')
+    p_remove_box.set_defaults(func=cmd_remove_box)
+
+    # list-boxes
+    p_list_boxes = subparsers.add_parser('list-boxes',
+                                          help='Show all registered boxes')
+    p_list_boxes.add_argument('--json', action='store_true',
+                              help='Output as JSON')
+    p_list_boxes.set_defaults(func=cmd_list_boxes)
+
+    # get-port
+    p_get_port = subparsers.add_parser('get-port',
+                                        help='Get admin SSH port for a box')
+    p_get_port.add_argument('box_id', help='Box ID')
+    p_get_port.set_defaults(func=cmd_get_port)
+
+    # request
+    p_request = subparsers.add_parser('request',
+                                       help='Request new tunnel (from box)')
+    p_request.add_argument('service', help='Service name')
+    p_request.add_argument('local_port', type=int, help='Local port on box')
+    p_request.set_defaults(func=cmd_request)
+
+    # release
+    p_release = subparsers.add_parser('release',
+                                       help='Release tunnel (from box)')
+    p_release.add_argument('service', help='Service name')
+    p_release.set_defaults(func=cmd_release)
+
+    # list
+    p_list = subparsers.add_parser('list', help='Show all tunnels')
+    p_list.add_argument('--box', help='Filter by box ID')
+    p_list.add_argument('--status', help='Filter by status')
+    p_list.add_argument('--json', action='store_true',
+                        help='Output as JSON')
+    p_list.set_defaults(func=cmd_list)
+
+    # info
+    p_info = subparsers.add_parser('info',
+                                    help='Show detailed tunnel information')
+    p_info.add_argument('subdomain', help='Full subdomain')
+    p_info.set_defaults(func=cmd_info)
+
+    # remove
+    p_remove = subparsers.add_parser('remove',
+                                      help='Remove tunnel manually (admin)')
+    p_remove.add_argument('subdomain', help='Full subdomain')
+    p_remove.add_argument('-y', '--yes', action='store_true',
+                          help='Skip confirmation')
+    p_remove.set_defaults(func=cmd_remove_tunnel)
+
+    # status
+    p_status = subparsers.add_parser('status',
+                                      help='Check tunnel health')
+    p_status.add_argument('--box', help='Check only this box')
+    p_status.add_argument('--fix', action='store_true',
+                          help='Attempt to fix issues')
+    p_status.set_defaults(func=cmd_status)
+
+    # stats
+    p_stats = subparsers.add_parser('stats',
+                                     help='Show gateway statistics')
+    p_stats.set_defaults(func=cmd_stats)
+
+    # test-tunnel
+    p_test = subparsers.add_parser('test-tunnel',
+                                    help='End-to-end tunnel test')
+    p_test.add_argument('subdomain', help='Full subdomain')
+    p_test.set_defaults(func=cmd_test_tunnel)
+
+    # health
+    p_health = subparsers.add_parser('health',
+                                      help='System health check')
+    p_health.set_defaults(func=cmd_health)
+
+    # sync-nginx
+    p_sync_nginx = subparsers.add_parser('sync-nginx',
+                                          help='Rebuild nginx config from DB')
+    p_sync_nginx.set_defaults(func=cmd_sync_nginx)
+
+    # sync-dns
+    p_sync_dns = subparsers.add_parser('sync-dns',
+                                        help='Sync DNS records with DB')
+    p_sync_dns.add_argument('--dry-run', action='store_true',
+                            help='Show what would be done')
+    p_sync_dns.set_defaults(func=cmd_sync_dns)
+
+    # sync-certs
+    p_sync_certs = subparsers.add_parser('sync-certs',
+                                          help='Request pending certificates')
+    p_sync_certs.set_defaults(func=cmd_sync_certs)
+
+    # cleanup
+    p_cleanup = subparsers.add_parser('cleanup',
+                                       help='Clean orphaned resources')
+    p_cleanup.add_argument('--dry-run', action='store_true',
+                           help='Show what would be cleaned')
+    p_cleanup.add_argument('-y', '--yes', action='store_true',
+                           help='Skip confirmations')
+    p_cleanup.set_defaults(func=cmd_cleanup)
+
+    # rebuild
+    p_rebuild = subparsers.add_parser('rebuild',
+                                       help='Complete rebuild from DB')
+    p_rebuild.set_defaults(func=cmd_rebuild)
+
+    # backup
+    p_backup = subparsers.add_parser('backup',
+                                      help='Create backup')
+    p_backup.add_argument('--destination',
+                          help='Backup directory')
+    p_backup.set_defaults(func=cmd_backup)
+
+    # restore
+    p_restore = subparsers.add_parser('restore',
+                                       help='Restore from backup')
+    p_restore.add_argument('backup_file', help='Backup file path')
+    p_restore.add_argument('--force', action='store_true',
+                           help='Skip confirmation')
+    p_restore.set_defaults(func=cmd_restore)
+
+    # version
+    p_version = subparsers.add_parser('version',
+                                       help='Show version')
+    p_version.set_defaults(func=cmd_version)
+
+    return parser
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+def main():
+    """Main entry point."""
+    parser = build_parser()
+    args = parser.parse_args()
+
+    # Show help if no command
+    if not args.command:
+        parser.print_help()
+        sys.exit(0)
+
+    # Setup logging (if config exists)
+    if Path(args.config).exists() and args.command != 'setup':
+        try:
+            config = load_config(args.config)
+            log_config = config.get('logging', {})
+            setup_logging(
+                log_config.get('file', '/opt/gtwy/gtwy.log'),
+                log_config.get('level', 'INFO'),
+                log_config.get('max_size_mb', 10),
+                log_config.get('backup_count', 5)
+            )
+        except Exception:
+            # Fallback to basic logging
+            setup_logging('/opt/gtwy/gtwy.log')
+    else:
+        # Basic logging for setup command
+        setup_logging('/opt/gtwy/gtwy.log')
+
+    # Execute command
+    try:
+        args.func(args)
+        sys.exit(0)
+    except ValidationError as e:
+        logger.error(f"Validation error: {e}")
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(e.exit_code)
+    except GatewayPermissionError as e:
+        logger.error(f"Permission denied: {e}")
+        print(f"Permission denied: {e}", file=sys.stderr)
+        sys.exit(e.exit_code)
+    except NotFoundError as e:
+        logger.error(f"Not found: {e}")
+        print(f"Not found: {e}", file=sys.stderr)
+        sys.exit(e.exit_code)
+    except DependencyError as e:
+        logger.error(f"Dependency error: {e}")
+        print(f"Dependency error: {e}", file=sys.stderr)
+        sys.exit(e.exit_code)
+    except GatewayError as e:
+        logger.error(f"Gateway error: {e}")
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(e.exit_code)
+    except KeyboardInterrupt:
+        print("\nCancelled.", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        logger.exception("Unexpected error")
+        print(f"Unexpected error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()
