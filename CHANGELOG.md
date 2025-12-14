@@ -40,6 +40,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - No longer tries to write to `/opt/gtwy/gtwy.log` (permission denied)
   - Regular admin commands still use file logging
 
+- **Database permissions** - Fixed readonly database error for SSH commands
+  - `init_database()` now automatically sets correct permissions
+  - Directory `/opt/gtwy`: root:gtwy-admin 775
+  - Database file: tunneluser:gtwy-admin 664
+  - Allows tunneluser to write via SSH (request/release commands)
+
 ### Technical
 - Added v1.2.1 to version sequences in migration runners
 - Improved error handling for config parsing edge cases
@@ -60,10 +66,11 @@ sudo ./tnl update
 # Works! Automatically creates config.yml from systemd service
 ```
 
-**IMPORTANT - Manual Step for Existing Boxes:**
+**IMPORTANT - Manual Steps for Existing Installations:**
 
-If you registered boxes before v1.2.1, you need to update their authorized_keys entry on the gateway:
+If you installed gtwy before v1.2.1, you need to make these changes on the gateway:
 
+**1. Fix authorized_keys (for existing boxes):**
 ```bash
 # On gateway server:
 sudo nano /home/tunneluser/.ssh/authorized_keys
@@ -77,7 +84,16 @@ command="BOX_ID=xyz /opt/gtwy/gtwy request",restrict,port-forwarding ssh-ed25519
 command="BOX_ID=xyz /usr/local/bin/gtwy $SSH_ORIGINAL_COMMAND",restrict,port-forwarding ssh-ed25519 AAAA...
 ```
 
-**New boxes** (added with v1.2.1) get the correct entry automatically.
+**2. Fix database permissions:**
+```bash
+# On gateway server:
+sudo chown tunneluser:gtwy-admin /opt/gtwy/tunnels.db
+sudo chmod 664 /opt/gtwy/tunnels.db
+sudo chown root:gtwy-admin /opt/gtwy
+sudo chmod 775 /opt/gtwy
+```
+
+**New installations** (v1.2.1+) get correct permissions automatically.
 
 ## [1.2.0] - 2025-12-14
 
