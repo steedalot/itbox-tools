@@ -910,6 +910,53 @@ def detect_installed_version():
 
     return "1.0.0"  # Assume oldest if unknown
 
+def run_config_migrations(config, config_path, from_version, to_version):
+    """Run config migrations from one version to another.
+
+    Args:
+        config: Current config dict
+        config_path: Path to config file
+        from_version: Version to migrate from
+        to_version: Version to migrate to
+
+    Returns:
+        Number of migrations run
+    """
+    migrations = {
+        "1.2.0_to_1.2.1": migrate_config_1_2_0_to_1_2_1,
+    }
+
+    # Determine which migrations to run
+    version_sequence = ["1.0.0", "1.1.0", "1.2.0", "1.2.1"]
+
+    try:
+        from_idx = version_sequence.index(from_version)
+        to_idx = version_sequence.index(to_version)
+    except ValueError:
+        logger.warning(f"Unknown version in migration: {from_version} → {to_version}")
+        return 0
+
+    migrations_run = 0
+    config_modified = False
+
+    for i in range(from_idx, to_idx):
+        current_v = version_sequence[i]
+        next_v = version_sequence[i + 1]
+        migration_key = f"{current_v}_to_{next_v}"
+
+        if migration_key in migrations:
+            print(f"   Running config migration: {migration_key}")
+            config = migrations[migration_key](config)
+            config_modified = True
+            migrations_run += 1
+
+    # Save config if modified
+    if config_modified:
+        save_config(config, config_path)
+        print(f"   ✓ Config saved: {config_path}")
+
+    return migrations_run
+
 def run_database_migrations(conn, from_version, to_version):
     """Run database migrations from one version to another."""
 
@@ -955,6 +1002,24 @@ def run_database_migrations(conn, from_version, to_version):
     """, (to_version, datetime.now(timezone.utc).isoformat()))
 
     return migrations_run
+
+def migrate_config_1_2_0_to_1_2_1(config):
+    """Config migration for v1.2.1 - Fix nginx config path permissions.
+
+    Changes:
+    - nginx.config_path: /etc/nginx/sites-enabled/tunnels-autogen.conf
+      → /opt/gtwy/nginx-configs/tunnels-autogen.conf
+    """
+    old_path = '/etc/nginx/sites-enabled/tunnels-autogen.conf'
+    new_path = '/opt/gtwy/nginx-configs/tunnels-autogen.conf'
+
+    if config.get('nginx', {}).get('config_path') == old_path:
+        print(f"      Updating nginx.config_path:")
+        print(f"         {old_path}")
+        print(f"      → {new_path}")
+        config['nginx']['config_path'] = new_path
+
+    return config
 
 def migrate_1_0_0_to_1_1_0(conn):
     """Migration for v1.1.0 - no schema changes needed."""
@@ -1254,10 +1319,28 @@ def cmd_update(args):
         conn.commit()
         conn.close()
 
-    # 4. Validate configuration
-    print("\n4. Validating configuration...")
+    # 4. Run config migrations
+    print("\n4. Running config migrations...")
     try:
         config = load_config(DEFAULT_CONFIG_PATH)
+
+        # Run config migrations
+        migrations_run = run_config_migrations(config, DEFAULT_CONFIG_PATH, installed_version, current_version)
+
+        if migrations_run:
+            print(f"   ✓ {migrations_run} config migration(s) applied")
+        else:
+            print("   ✓ Config up to date")
+
+        # Reload config after migrations
+        config = load_config(DEFAULT_CONFIG_PATH)
+    except Exception as e:
+        print(f"   ⚠ Config migration warning: {e}")
+        config = load_config(DEFAULT_CONFIG_PATH)
+
+    # 5. Validate configuration
+    print("\n5. Validating configuration...")
+    try:
         warnings = validate_config(config)
 
         if not warnings:
@@ -1270,7 +1353,35 @@ def cmd_update(args):
     except Exception as e:
         print(f"   ⚠ Could not validate config: {e}")
 
-    # 5. Success
+    # 6. Setup nginx configs directory and symlink (for v1.2.0 → v1.2.1)
+    if installed_version == "1.2.0" and current_version == "1.2.1":
+        print("\n6. Configuring nginx permissions...")
+        try:
+            import grp
+            nginx_configs_dir = Path('/opt/gtwy/nginx-configs')
+            nginx_configs_dir.mkdir(parents=True, exist_ok=True)
+
+            # Set ownership: root:gtwy-admin 775
+            gtwy_admin_gid = grp.getgrnam('gtwy-admin').gr_gid
+            os.chown(nginx_configs_dir, 0, gtwy_admin_gid)
+            os.chmod(nginx_configs_dir, 0o775)
+
+            # Create symlink
+            nginx_symlink = Path('/etc/nginx/sites-enabled/tunnels-autogen.conf')
+            nginx_target = nginx_configs_dir / 'tunnels-autogen.conf'
+
+            if nginx_symlink.exists() or nginx_symlink.is_symlink():
+                nginx_symlink.unlink()
+
+            nginx_symlink.symlink_to(nginx_target)
+            print(f"   ✓ nginx configs directory: root:gtwy-admin 775")
+            print(f"   ✓ Symlink: {nginx_symlink} → {nginx_target}")
+        except Exception as e:
+            print(f"   ⚠ Warning: Could not setup nginx permissions: {e}")
+            print(f"   Please manually create symlink:")
+            print(f"      sudo ln -sf /opt/gtwy/nginx-configs/tunnels-autogen.conf /etc/nginx/sites-enabled/tunnels-autogen.conf")
+
+    # 7. Success
     print("\n" + "="*60)
     print(f"✓ gtwy updated successfully: {installed_version} → {current_version}")
     print("="*60)

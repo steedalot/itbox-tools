@@ -51,12 +51,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Directory: root:gtwy-admin 775
   - Symlink: `/etc/nginx/sites-enabled/tunnels-autogen.conf` → `/opt/gtwy/nginx-configs/tunnels-autogen.conf`
   - tunneluser (via SSH) can now write nginx configurations
+  - **Automatic migration**: `gtwy update` from v1.2.0 → v1.2.1 handles this automatically
 
 ### Technical
 - Added v1.2.1 to version sequences in migration runners
+- Added config migration framework (similar to database migrations)
+- `run_config_migrations()` - Automatic config updates during upgrade
+- `migrate_config_1_2_0_to_1_2_1()` - Updates nginx.config_path automatically
 - Improved error handling for config parsing edge cases
 - Better user feedback during update process
 - Console-only logging for SSH-invoked commands (BOX_ID env var detection)
+- Update command now creates nginx configs directory and symlink automatically
 
 ### Migration Notes (v1.0.0 → v1.2.1)
 **This release specifically fixes the v1.0.0 → v1.2.x upgrade path.**
@@ -72,9 +77,24 @@ sudo ./tnl update
 # Works! Automatically creates config.yml from systemd service
 ```
 
-**IMPORTANT - Manual Steps for Existing Installations:**
+**Upgrading from v1.2.0 → v1.2.1:**
 
-If you installed gtwy before v1.2.1, you need to make these changes on the gateway:
+Most fixes are applied automatically by running:
+```bash
+curl -LO https://github.com/steedalot/tnld/releases/latest/download/gtwy
+chmod +x gtwy
+sudo ./gtwy update
+```
+
+The update command will automatically:
+- Migrate config.yml (update nginx.config_path)
+- Create nginx configs directory with correct permissions
+- Create symlink for nginx configs
+- Migrate database permissions
+
+**Manual Steps (only for v1.2.0 installations):**
+
+After running `sudo gtwy update`, you need to manually fix:
 
 **1. Fix authorized_keys (for existing boxes):**
 ```bash
@@ -97,24 +117,6 @@ sudo chown tunneluser:gtwy-admin /opt/gtwy/tunnels.db
 sudo chmod 664 /opt/gtwy/tunnels.db
 sudo chown root:gtwy-admin /opt/gtwy
 sudo chmod 775 /opt/gtwy
-```
-
-**3. Fix nginx config permissions:**
-```bash
-# On gateway server:
-sudo mkdir -p /opt/gtwy/nginx-configs
-sudo chown root:gtwy-admin /opt/gtwy/nginx-configs
-sudo chmod 775 /opt/gtwy/nginx-configs
-
-# Create symlink
-sudo ln -sf /opt/gtwy/nginx-configs/tunnels-autogen.conf \
-  /etc/nginx/sites-enabled/tunnels-autogen.conf
-
-# If old config exists, migrate it
-if [ -f /etc/nginx/sites-enabled/tunnels-autogen.conf ] && [ ! -L /etc/nginx/sites-enabled/tunnels-autogen.conf ]; then
-  sudo mv /etc/nginx/sites-enabled/tunnels-autogen.conf \
-    /opt/gtwy/nginx-configs/tunnels-autogen.conf
-fi
 ```
 
 **New installations** (v1.2.1+) get correct permissions automatically.
