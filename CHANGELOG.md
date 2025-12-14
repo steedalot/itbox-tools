@@ -5,6 +5,83 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2025-12-14
+
+### Added
+
+#### gtwy (Gateway Manager)
+- **`update` command** - Update gtwy to new version while preserving configuration
+  - Automatic backup creation (`/opt/gtwy/backup-YYYYMMDD-HHMMSS/`)
+  - Preserves `config.yml` (IONOS API keys, gateway settings)
+  - Preserves `tunnels.db` (boxes and tunnels)
+  - Database schema migration system
+  - Version detection from installed binary or database
+  - Validates configuration after update
+  - `--force` flag to force update even if same version
+
+- **Enhanced `add-box` output** - Copy-paste ready setup instructions
+  - Displays complete `tnl setup` command with correct IP and ports
+  - Clear step-by-step instructions for box setup
+  - Formatted box with visual separators
+
+#### tnl (Tunnel Client)
+- **`update` command** - Update tnl to new version while preserving configuration
+  - Automatic backup creation (`/etc/tnl/backup-YYYYMMDD-HHMMSS/`)
+  - Preserves `config.yml` (gateway details, service tunnels)
+  - Preserves SSH keys (`/home/tunneluser/.ssh/tunnel_key*`)
+  - Graceful service restart (stops all tnl services, updates, restarts)
+  - Config migration system for future upgrades
+  - Real-time service status after restart
+  - `--force` flag to force update even if same version
+
+### Changed
+- Project repository renamed to `tnld` (Tunnel Daemon Infrastructure)
+  - Repository: https://github.com/steedalot/tnld
+  - Tool names unchanged: `gtwy` and `tnl` remain the same
+
+### Technical
+
+#### Update Mechanism
+- **Version detection**: Queries installed binary `version` command or fallback to metadata
+- **Migration framework**: Sequential migration runner for future schema/config changes
+- **Backup system**: Timestamped backups before any changes
+- **Rollback capability**: Manual rollback by restoring from backup directory
+
+#### Database Migrations (gtwy)
+- New `metadata` table for schema version tracking
+- Migration runner: `run_database_migrations(conn, from_version, to_version)`
+- Extensible for future versions (v1.3.0+)
+
+#### Config Migrations (tnl)
+- Config metadata: `_meta.schema_version` in `config.yml`
+- Migration runner: `run_config_migrations(config, from_version, to_version)`
+- Extensible for future config format changes
+
+### Migration Notes (v1.1.0 → v1.2.0)
+- **No breaking changes** - v1.2.0 is fully backward compatible with v1.1.0
+- **Recommended upgrade order**: Update gtwy first, then tnl on boxes
+- **Update command**:
+  ```bash
+  # Gateway
+  curl -LO https://github.com/steedalot/tnld/releases/latest/download/gtwy
+  chmod +x gtwy
+  sudo ./gtwy update
+
+  # Box
+  curl -LO https://github.com/steedalot/tnld/releases/latest/download/tnl
+  chmod +x tnl
+  sudo ./tnl update
+  ```
+- **Rollback** (if needed):
+  ```bash
+  # gtwy
+  sudo cp /opt/gtwy/backup-YYYYMMDD-HHMMSS/gtwy.old /usr/local/bin/gtwy
+
+  # tnl
+  sudo cp /etc/tnl/backup-YYYYMMDD-HHMMSS/tnl.old /usr/local/bin/tnl
+  sudo systemctl restart tnl-admin.service
+  ```
+
 ## [1.1.0] - 2025-12-14
 
 ### Added

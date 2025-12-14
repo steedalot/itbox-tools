@@ -33,7 +33,7 @@ from typing import Optional, Dict, List, Any, Tuple
 # CONSTANTS
 # ============================================================================
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 DEFAULT_CONFIG_PATH = "/opt/gtwy/config.yml"
 DEFAULT_DB_PATH = "/opt/gtwy/tunnels.db"
 
@@ -835,6 +835,114 @@ def format_last_seen(last_seen_str: Optional[str]) -> str:
         return "unknown"
 
 # ============================================================================
+# UPDATE MECHANISM
+# ============================================================================
+
+def detect_installed_version():
+    """Detect currently installed version of gtwy."""
+    installed_path = Path("/usr/local/bin/gtwy")
+
+    if not installed_path.exists():
+        return None
+
+    try:
+        result = subprocess.run(
+            [str(installed_path), "version"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+
+        # Parse "gtwy v1.1.0" or "tnl v1.1.0"
+        match = re.search(r'v?(\d+\.\d+\.\d+)', result.stdout)
+        if match:
+            return match.group(1)
+    except Exception:
+        pass
+
+    # Fallback: check database metadata
+    try:
+        if Path(DEFAULT_DB_PATH).exists():
+            conn = sqlite3.connect(DEFAULT_DB_PATH)
+            cursor = conn.execute("SELECT value FROM metadata WHERE key = 'schema_version'")
+            row = cursor.fetchone()
+            conn.close()
+            if row:
+                return row[0]
+    except Exception:
+        pass
+
+    return "1.0.0"  # Assume oldest if unknown
+
+def run_database_migrations(conn, from_version, to_version):
+    """Run database migrations from one version to another."""
+
+    migrations = {
+        "1.0.0_to_1.1.0": migrate_1_0_0_to_1_1_0,
+        "1.1.0_to_1.2.0": migrate_1_1_0_to_1_2_0,
+    }
+
+    # Determine which migrations to run
+    version_sequence = ["1.0.0", "1.1.0", "1.2.0"]
+
+    try:
+        from_idx = version_sequence.index(from_version)
+        to_idx = version_sequence.index(to_version)
+    except ValueError:
+        logger.warning(f"Unknown version in migration: {from_version} → {to_version}")
+        return 0
+
+    migrations_run = 0
+
+    for i in range(from_idx, to_idx):
+        current_v = version_sequence[i]
+        next_v = version_sequence[i + 1]
+        migration_key = f"{current_v}_to_{next_v}"
+
+        if migration_key in migrations:
+            print(f"   Running migration: {migration_key}")
+            migrations[migration_key](conn)
+            migrations_run += 1
+
+    # Create or update schema version in metadata table
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+
+    conn.execute("""
+        INSERT OR REPLACE INTO metadata (key, value, updated_at)
+        VALUES ('schema_version', ?, ?)
+    """, (to_version, datetime.now(timezone.utc).isoformat()))
+
+    return migrations_run
+
+def migrate_1_0_0_to_1_1_0(conn):
+    """Migration for v1.1.0 - no schema changes needed."""
+    pass
+
+def migrate_1_1_0_to_1_2_0(conn):
+    """Migration for v1.2.0 - no schema changes needed."""
+    pass
+
+def validate_config(config):
+    """Validate configuration structure."""
+    required_keys = ['ionos', 'gateway', 'ports', 'ssh', 'certbot']
+
+    for key in required_keys:
+        if key not in config:
+            raise ValidationError(f"Missing required config key: {key}")
+
+    # Validate IONOS config
+    if 'public_prefix' not in config['ionos'] or 'secret' not in config['ionos']:
+        raise ValidationError("Missing IONOS API credentials")
+
+    return True
+
+# ============================================================================
 # COMMANDS - INSTALLATION
 # ============================================================================
 
@@ -998,6 +1106,106 @@ tunneluser ALL=(root) NOPASSWD: /usr/bin/certbot certificates
     print("     sudo gtwy add-box <box-id> <domain> <ssh-public-key>")
     print("\ngtwy is now available globally as 'gtwy' command.")
     print("="*60)
+
+def cmd_update(args):
+    """Update gtwy to new version while preserving configuration."""
+    print("🔄 gtwy Update\n")
+
+    # Check if running as root
+    if os.geteuid() != 0:
+        print("❌ Error: Update must be run as root")
+        print("   Run: sudo ./gtwy update")
+        sys.exit(1)
+
+    # Check if gtwy is installed
+    if not Path(DEFAULT_CONFIG_PATH).exists():
+        print("❌ gtwy not installed. Run 'sudo gtwy install' first.")
+        sys.exit(1)
+
+    # Check versions
+    installed_version = detect_installed_version()
+    current_version = VERSION
+
+    if installed_version == current_version:
+        print(f"✓ Already running latest version: {current_version}")
+        if not args.force:
+            return
+        print("  --force specified, continuing anyway...")
+    else:
+        print(f"  Installed: {installed_version}")
+        print(f"  New:       {current_version}")
+
+    # 1. Create backup
+    print("\n1. Creating backup...")
+    backup_dir = f"/opt/gtwy/backup-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
+    Path(backup_dir).mkdir(parents=True, exist_ok=True)
+
+    # Backup config and database
+    if Path(DEFAULT_CONFIG_PATH).exists():
+        shutil.copy2(DEFAULT_CONFIG_PATH, f"{backup_dir}/config.yml")
+
+    if Path(DEFAULT_DB_PATH).exists():
+        shutil.copy2(DEFAULT_DB_PATH, f"{backup_dir}/tunnels.db")
+
+    # Backup current executable
+    if Path("/usr/local/bin/gtwy").exists():
+        shutil.copy2("/usr/local/bin/gtwy", f"{backup_dir}/gtwy.old")
+
+    print(f"   ✓ Backup created: {backup_dir}")
+
+    # 2. Copy new executable
+    print("\n2. Installing new version...")
+    current_script = Path(__file__).resolve()
+    shutil.copy2(current_script, "/usr/local/bin/gtwy")
+    os.chmod("/usr/local/bin/gtwy", 0o755)
+    print("   ✓ Executable updated")
+
+    # 3. Run database migrations
+    print("\n3. Running database migrations...")
+
+    if not Path(DEFAULT_DB_PATH).exists():
+        print("   ⚠ No database found, skipping migrations")
+    else:
+        conn = get_db_connection(DEFAULT_DB_PATH)
+
+        # Check schema version
+        try:
+            cursor = conn.execute("SELECT value FROM metadata WHERE key = 'schema_version'")
+            row = cursor.fetchone()
+            schema_version = row[0] if row else "1.0.0"
+        except sqlite3.OperationalError:
+            # metadata table doesn't exist - v1.0.0
+            schema_version = "1.0.0"
+
+        print(f"   Database schema: {schema_version}")
+
+        # Run migrations
+        migrations_run = run_database_migrations(conn, schema_version, current_version)
+
+        if migrations_run:
+            print(f"   ✓ {migrations_run} migration(s) applied")
+        else:
+            print("   ✓ Database schema up to date")
+
+        conn.commit()
+        conn.close()
+
+    # 4. Validate configuration
+    print("\n4. Validating configuration...")
+    try:
+        config = load_config(DEFAULT_CONFIG_PATH)
+        validate_config(config)
+        print("   ✓ Configuration valid")
+    except Exception as e:
+        print(f"   ⚠ Configuration validation warning: {e}")
+        print("   You may need to run 'sudo gtwy setup --update' to fix config")
+
+    # 5. Success
+    print("\n" + "="*60)
+    print(f"✓ gtwy updated successfully: {installed_version} → {current_version}")
+    print("="*60)
+    print(f"\nBackup stored at: {backup_dir}")
+    print("\nChangelog: https://github.com/steedalot/tnld/releases")
 
 # ============================================================================
 # COMMANDS - SETUP
@@ -1240,15 +1448,44 @@ def cmd_add_box(args):
 
     if config.get('gateway', {}).get('hostname'):
         hostname = config['gateway']['hostname']
+        gateway_address = hostname
         print(f"                ssh -p {admin_ssh_port} tunneluser@{hostname}")
     else:
         ip = config['gateway']['public_ip']
+        gateway_address = ip
         print(f"                ssh -p {admin_ssh_port} tunneluser@{ip}")
 
     print(f"  SSH Key Type: {key_type}")
     print(f"  Fingerprint:  {fingerprint}")
     print()
     print(f"Tunnels for this box will use: <service>.{box_id}.{domain}")
+
+    # NEW: Setup instructions
+    print()
+    print("━" * 70)
+    print("🚀 Box Setup Instructions")
+    print("━" * 70)
+    print()
+    print("On the IT.Box, run:")
+    print()
+
+    # Determine SSH port (default 22 or custom)
+    ssh_port = config.get('gateway', {}).get('ssh_port', 22)
+
+    if ssh_port == 22:
+        # Omit ssh_port for default
+        setup_cmd = f"  sudo tnl setup {gateway_address} {admin_ssh_port}"
+    else:
+        setup_cmd = f"  sudo tnl setup {gateway_address} {admin_ssh_port} {ssh_port}"
+
+    print(setup_cmd)
+    print()
+    print("This will:")
+    print("  1. Create admin tunnel (reverse SSH)")
+    print("  2. Allow remote management from gateway")
+    print("  3. Enable service tunnel requests")
+    print()
+    print("━" * 70)
 
     logger.info(f"Box {box_id} added (domain: {domain}, port: {admin_ssh_port})")
 
@@ -2498,6 +2735,13 @@ def build_parser():
     p_install.add_argument('--force', action='store_true',
                           help='Force reinstallation')
     p_install.set_defaults(func=cmd_install)
+
+    # update
+    p_update = subparsers.add_parser('update',
+                                      help='Update gtwy to new version')
+    p_update.add_argument('--force', action='store_true',
+                         help='Force update even if same version')
+    p_update.set_defaults(func=cmd_update)
 
     # setup
     p_setup = subparsers.add_parser('setup', help='Interactive initial setup')

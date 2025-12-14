@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 # CONSTANTS
 # ============================================================================
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 TUNNELUSER = "tunneluser"
 TUNNELUSER_HOME = "/home/tunneluser"
 SSH_KEY_PATH = f"{TUNNELUSER_HOME}/.ssh/tunnel_key"
@@ -221,6 +221,87 @@ def get_service_status(service):
     return result.stdout.strip()
 
 # ============================================================================
+# UPDATE MECHANISM
+# ============================================================================
+
+def detect_installed_version():
+    """Detect currently installed version of tnl."""
+    installed_path = Path("/usr/local/bin/tnl")
+
+    if not installed_path.exists():
+        return None
+
+    try:
+        result = subprocess.run(
+            [str(installed_path), "version"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+
+        # Parse "tnl v1.1.0"
+        match = re.search(r'v?(\d+\.\d+\.\d+)', result.stdout)
+        if match:
+            return match.group(1)
+    except Exception:
+        pass
+
+    # Fallback: check config for version hint
+    try:
+        if Path(TNL_CONFIG_FILE).exists():
+            config = load_config()
+            if '_meta' in config and 'schema_version' in config['_meta']:
+                return config['_meta']['schema_version']
+    except Exception:
+        pass
+
+    return "1.0.0"  # Assume oldest if unknown
+
+def run_config_migrations(config, from_version, to_version):
+    """Run config migrations from one version to another."""
+
+    migrations = {
+        "1.0.0_to_1.1.0": migrate_config_1_0_0_to_1_1_0,
+        "1.1.0_to_1.2.0": migrate_config_1_1_0_to_1_2_0,
+    }
+
+    version_sequence = ["1.0.0", "1.1.0", "1.2.0"]
+
+    try:
+        from_idx = version_sequence.index(from_version)
+        to_idx = version_sequence.index(to_version)
+    except ValueError:
+        print(f"   ⚠ Unknown version in migration: {from_version} → {to_version}")
+        return 0
+
+    migrations_run = 0
+
+    for i in range(from_idx, to_idx):
+        current_v = version_sequence[i]
+        next_v = version_sequence[i + 1]
+        migration_key = f"{current_v}_to_{next_v}"
+
+        if migration_key in migrations:
+            print(f"   Running migration: {migration_key}")
+            migrations[migration_key](config)
+            migrations_run += 1
+
+    # Update config schema version
+    config['_meta'] = config.get('_meta', {})
+    config['_meta']['schema_version'] = to_version
+
+    return migrations_run
+
+def migrate_config_1_0_0_to_1_1_0(config):
+    """v1.1.0 added tunnels dict."""
+    if 'tunnels' not in config:
+        config['tunnels'] = {}
+
+def migrate_config_1_1_0_to_1_2_0(config):
+    """v1.2.0 - no config changes needed."""
+    pass
+
+# ============================================================================
 # COMMANDS
 # ============================================================================
 
@@ -334,6 +415,117 @@ def cmd_install(args):
     print("     sudo tnl setup <gateway-ip> <admin-port>")
     print("     Example: sudo tnl setup 192.168.1.100 20001")
     print("="*60)
+
+def cmd_update(args):
+    """Update tnl to new version while preserving configuration."""
+    print("🔄 tnl Update\n")
+
+    check_root()
+
+    # Check if tnl is configured
+    if not Path(TNL_CONFIG_FILE).exists():
+        print("❌ tnl not configured. Run 'sudo tnl setup' first.")
+        sys.exit(1)
+
+    # Check versions
+    installed_version = detect_installed_version()
+    current_version = VERSION
+
+    if installed_version == current_version:
+        print(f"✓ Already running latest version: {current_version}")
+        if not args.force:
+            return
+        print("  --force specified, continuing anyway...")
+    else:
+        print(f"  Installed: {installed_version}")
+        print(f"  New:       {current_version}")
+
+    # 1. Create backup
+    print("\n1. Creating backup...")
+    backup_dir = f"/etc/tnl/backup-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
+    Path(backup_dir).mkdir(parents=True, exist_ok=True)
+
+    # Backup config
+    if Path(TNL_CONFIG_FILE).exists():
+        import shutil
+        shutil.copy2(TNL_CONFIG_FILE, f"{backup_dir}/config.yml")
+
+    # Backup current executable
+    if Path("/usr/local/bin/tnl").exists():
+        shutil.copy2("/usr/local/bin/tnl", f"{backup_dir}/tnl.old")
+
+    print(f"   ✓ Backup created: {backup_dir}")
+
+    # 2. Stop running services
+    print("\n2. Stopping services...")
+    services = ["tnl-admin.service"]
+
+    # Find all tnl-* services
+    result = run_command(
+        ["systemctl", "list-units", "tnl-*.service", "--no-legend", "--all"],
+        capture_output=True,
+        check=False
+    )
+
+    if result.returncode == 0:
+        for line in result.stdout.splitlines():
+            if line.strip():
+                service = line.split()[0]
+                if service not in services:
+                    services.append(service)
+
+    for service in services:
+        run_command(["systemctl", "stop", service], check=False)
+
+    print(f"   ✓ {len(services)} service(s) stopped")
+
+    # 3. Install new executable
+    print("\n3. Installing new version...")
+    current_script = Path(__file__).resolve()
+    import shutil
+    shutil.copy2(current_script, "/usr/local/bin/tnl")
+    os.chmod("/usr/local/bin/tnl", 0o755)
+    print("   ✓ Executable updated")
+
+    # 4. Migrate config if needed
+    print("\n4. Migrating configuration...")
+    config = load_config()
+
+    migrations_run = run_config_migrations(config, installed_version, current_version)
+
+    if migrations_run:
+        save_config(config)
+        print(f"   ✓ {migrations_run} migration(s) applied")
+    else:
+        print("   ✓ Configuration up to date")
+
+    # 5. Restart services
+    print("\n5. Restarting services...")
+    for service in services:
+        run_command(["systemctl", "start", service], check=False)
+
+    # Wait and check status
+    import time
+    time.sleep(2)
+
+    active = 0
+    for service in services:
+        result = run_command(
+            ["systemctl", "is-active", service],
+            check=False,
+            capture_output=True
+        )
+        if result.stdout.strip() == "active":
+            active += 1
+
+    print(f"   ✓ {active}/{len(services)} service(s) active")
+
+    # 6. Success
+    print("\n" + "="*60)
+    print(f"✓ tnl updated successfully: {installed_version} → {current_version}")
+    print("="*60)
+    print(f"\nBackup stored at: {backup_dir}")
+    print("\nChangelog: https://github.com/steedalot/tnld/releases")
 
 def cmd_setup(args):
     """Setup admin SSH tunnel to gateway server."""
@@ -724,6 +916,15 @@ def build_parser():
         help='Install tnl client (one-time setup)'
     )
     p_install.set_defaults(func=cmd_install)
+
+    # update
+    p_update = subparsers.add_parser(
+        'update',
+        help='Update tnl to new version'
+    )
+    p_update.add_argument('--force', action='store_true',
+                         help='Force update even if same version')
+    p_update.set_defaults(func=cmd_update)
 
     # setup
     p_setup = subparsers.add_parser(
