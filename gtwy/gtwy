@@ -1384,9 +1384,9 @@ def cmd_update(args):
     except Exception as e:
         print(f"   ⚠ Could not validate config: {e}")
 
-    # 6. Setup nginx configs directory and symlink (for v1.2.0 → v1.2.1)
-    if installed_version == "1.2.0" and current_version == "1.2.1":
-        print("\n6. Configuring nginx permissions...")
+    # 6. Setup nginx configs directory and symlink (always check/fix for v1.2.1+)
+    if current_version >= "1.2.1":
+        print("\n6. Checking nginx configuration...")
         try:
             import grp
             nginx_configs_dir = Path('/opt/gtwy/nginx-configs')
@@ -1407,17 +1407,29 @@ def cmd_update(args):
                 os.chown(nginx_config_file, 0, gtwy_admin_gid)
                 os.chmod(nginx_config_file, 0o664)
                 print(f"   ✓ Created initial nginx config")
+            else:
+                print(f"   ✓ nginx config exists")
 
             # Create symlink
             nginx_symlink = Path('/etc/nginx/sites-enabled/tunnels-autogen.conf')
             nginx_target = nginx_configs_dir / 'tunnels-autogen.conf'
 
+            symlink_needs_update = True
             if nginx_symlink.exists() or nginx_symlink.is_symlink():
-                nginx_symlink.unlink()
+                try:
+                    if nginx_symlink.resolve() == nginx_target.resolve():
+                        symlink_needs_update = False
+                        print(f"   ✓ Symlink correct")
+                except:
+                    pass
 
-            nginx_symlink.symlink_to(nginx_target)
+            if symlink_needs_update:
+                if nginx_symlink.exists() or nginx_symlink.is_symlink():
+                    nginx_symlink.unlink()
+                nginx_symlink.symlink_to(nginx_target)
+                print(f"   ✓ Symlink: {nginx_symlink} → {nginx_target}")
+
             print(f"   ✓ nginx configs directory: root:gtwy-admin 775")
-            print(f"   ✓ Symlink: {nginx_symlink} → {nginx_target}")
 
             # Test nginx config
             result = subprocess.run(['sudo', 'nginx', '-t'], capture_output=True, text=True)
@@ -1426,8 +1438,10 @@ def cmd_update(args):
             else:
                 print(f"   ⚠ nginx test warning: {result.stderr}")
         except Exception as e:
-            print(f"   ⚠ Warning: Could not setup nginx permissions: {e}")
-            print(f"   Please manually create symlink:")
+            print(f"   ⚠ Warning: Could not setup nginx: {e}")
+            print(f"   Please manually:")
+            print(f"      sudo mkdir -p /opt/gtwy/nginx-configs")
+            print(f"      sudo touch /opt/gtwy/nginx-configs/tunnels-autogen.conf")
             print(f"      sudo ln -sf /opt/gtwy/nginx-configs/tunnels-autogen.conf /etc/nginx/sites-enabled/tunnels-autogen.conf")
 
     # 7. Success
