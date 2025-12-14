@@ -196,6 +196,17 @@ def init_database(db_path: str = DEFAULT_DB_PATH):
     db_file = Path(db_path)
     db_file.parent.mkdir(parents=True, exist_ok=True)
 
+    # Set directory permissions: root:gtwy-admin 775
+    # This allows gtwy-admin group to write files in /opt/gtwy
+    try:
+        import pwd
+        import grp
+        gtwy_admin_gid = grp.getgrnam('gtwy-admin').gr_gid
+        os.chown(db_file.parent, 0, gtwy_admin_gid)
+        os.chmod(db_file.parent, 0o775)
+    except (KeyError, PermissionError):
+        pass
+
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
@@ -241,6 +252,20 @@ def init_database(db_path: str = DEFAULT_DB_PATH):
 
     conn.commit()
     conn.close()
+
+    # Set proper permissions: tunneluser:gtwy-admin 664
+    # This allows tunneluser (via SSH) to write to the database
+    try:
+        import pwd
+        import grp
+        tunneluser_uid = pwd.getpwnam('tunneluser').pw_uid
+        gtwy_admin_gid = grp.getgrnam('gtwy-admin').gr_gid
+        os.chown(db_path, tunneluser_uid, gtwy_admin_gid)
+        os.chmod(db_path, 0o664)
+    except (KeyError, PermissionError):
+        # If users/groups don't exist or we don't have permission, skip
+        # This happens during initial setup before users are created
+        pass
 
     logger.info(f"Database initialized at {db_path}")
 
