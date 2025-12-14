@@ -1015,7 +1015,12 @@ def cmd_install(args):
     gtwy_dir = Path('/opt/gtwy')
     gtwy_dir.mkdir(parents=True, exist_ok=True)
     (gtwy_dir / 'backups').mkdir(exist_ok=True)
+
+    # Create nginx-configs directory with gtwy-admin group write access
+    nginx_configs_dir = gtwy_dir / 'nginx-configs'
+    nginx_configs_dir.mkdir(exist_ok=True)
     print("   ✓ /opt/gtwy created")
+    print("   ✓ /opt/gtwy/nginx-configs created")
 
     # 2. Copy script itself to /opt/gtwy/gtwy
     print("\n2. Installing gtwy script...")
@@ -1075,6 +1080,25 @@ def cmd_install(args):
     os.chown(ssh_dir, tunneluser_uid, tunneluser_gid)
     os.chown(auth_keys, tunneluser_uid, tunneluser_gid)
     print("   ✓ SSH directory configured")
+
+    # 7b. Setup nginx configs directory permissions and symlink
+    print("\n5b. Configuring nginx...")
+    gtwy_admin_gid = grp.getgrnam('gtwy-admin').gr_gid
+
+    # Set ownership of nginx-configs directory: root:gtwy-admin
+    os.chown(nginx_configs_dir, 0, gtwy_admin_gid)
+    os.chmod(nginx_configs_dir, 0o775)
+
+    # Create symlink from /etc/nginx/sites-enabled to /opt/gtwy/nginx-configs
+    nginx_symlink = Path('/etc/nginx/sites-enabled/tunnels-autogen.conf')
+    nginx_target = nginx_configs_dir / 'tunnels-autogen.conf'
+
+    if nginx_symlink.exists() or nginx_symlink.is_symlink():
+        nginx_symlink.unlink()
+
+    nginx_symlink.symlink_to(nginx_target)
+    print("   ✓ nginx configs directory: root:gtwy-admin 775")
+    print(f"   ✓ Symlink: {nginx_symlink} → {nginx_target}")
 
     # 8. Create sudo rules
     print("\n6. Creating sudo rules...")
@@ -1359,7 +1383,7 @@ def cmd_setup(args):
 
     # Paths
     config['nginx'] = {
-        'config_path': '/etc/nginx/sites-enabled/tunnels-autogen.conf',
+        'config_path': '/opt/gtwy/nginx-configs/tunnels-autogen.conf',
         'template_path': '/opt/gtwy/nginx-template'
     }
 
