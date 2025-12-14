@@ -121,6 +121,17 @@ class NoPortsAvailable(GatewayError):
 
 logger = logging.getLogger('gtwy')
 
+def setup_console_logging(level: str = 'INFO'):
+    """Configure console-only logging (for SSH commands)."""
+    log_level = getattr(logging, level.upper(), logging.INFO)
+
+    console_handler = logging.StreamHandler()
+    formatter = logging.Formatter('%(levelname)s: %(message)s')
+    console_handler.setFormatter(formatter)
+
+    logger.addHandler(console_handler)
+    logger.setLevel(log_level)
+
 def setup_logging(log_file: str, level: str = 'INFO', max_mb: int = 10, backup_count: int = 5):
     """Configure logging with rotation."""
     log_level = getattr(logging, level.upper(), logging.INFO)
@@ -2917,8 +2928,12 @@ def main():
         parser.print_help()
         sys.exit(0)
 
-    # Setup logging (if config exists)
-    if Path(args.config).exists() and args.command != 'setup':
+    # Setup logging
+    # For SSH commands (BOX_ID set), use console-only logging
+    if os.environ.get('BOX_ID'):
+        setup_console_logging()
+    # For regular commands, use file logging
+    elif Path(args.config).exists() and args.command != 'setup':
         try:
             config = load_config(args.config)
             log_config = config.get('logging', {})
@@ -2929,11 +2944,11 @@ def main():
                 log_config.get('backup_count', 5)
             )
         except Exception:
-            # Fallback to basic logging
-            setup_logging('/opt/gtwy/gtwy.log')
+            # Fallback to console logging if file logging fails
+            setup_console_logging()
     else:
-        # Basic logging for setup command
-        setup_logging('/opt/gtwy/gtwy.log')
+        # For setup/install, use console logging (no config yet)
+        setup_console_logging()
 
     # Execute command
     try:
