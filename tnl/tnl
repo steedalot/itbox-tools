@@ -11,6 +11,7 @@ import argparse
 import yaml
 import json
 import re
+import shutil
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -387,7 +388,6 @@ def cmd_install(args):
     target_script = Path("/usr/local/bin/tnl")
 
     if current_script != target_script:
-        import shutil
         shutil.copy2(current_script, target_script)
         os.chmod(target_script, 0o755)
         print(f"   ✓ Copied to {target_script}")
@@ -448,7 +448,6 @@ def cmd_update(args):
 
     # Backup config
     if Path(TNL_CONFIG_FILE).exists():
-        import shutil
         shutil.copy2(TNL_CONFIG_FILE, f"{backup_dir}/config.yml")
 
     # Backup current executable
@@ -483,7 +482,6 @@ def cmd_update(args):
     # 3. Install new executable
     print("\n3. Installing new version...")
     current_script = Path(__file__).resolve()
-    import shutil
     shutil.copy2(current_script, "/usr/local/bin/tnl")
     os.chmod("/usr/local/bin/tnl", 0o755)
     print("   ✓ Executable updated")
