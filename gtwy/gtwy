@@ -524,6 +524,10 @@ def generate_nginx_config(conn: sqlite3.Connection, template_path: str = None) -
         block = block.replace('{SERVER_PORT}', str(tunnel['server_port']))
         config_blocks.append(block)
 
+    # Return valid config even if no tunnels exist
+    if not config_blocks:
+        return "# No tunnels configured yet\n"
+
     return "\n\n".join(config_blocks)
 
 def test_nginx_config() -> bool:
