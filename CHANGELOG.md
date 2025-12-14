@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] - 2025-12-14
+
+### Fixed
+
+#### tnl (Tunnel Client)
+- **v1.0.0 → v1.2.x update path** - Fixed update failure for v1.0.0 installations
+  - v1.0.0 didn't have `/etc/tnl/config.yml` (introduced in v1.1.0)
+  - Update now checks for systemd service OR SSH key instead of just config file
+  - Automatic config migration: parses systemd service to create `config.yml`
+  - Extracts gateway IP, admin_port, ssh_port from existing service file
+  - Seamless upgrade from v1.0.0 without manual intervention
+
+#### gtwy (Gateway Manager)
+- **Configuration validation** - Changed from errors to warnings
+  - Old configs with different structure no longer fail validation
+  - Missing recommended keys now show as warnings, not errors
+  - Non-critical warnings don't prevent successful update
+  - Clear messaging: "These are non-critical, gtwy should work normally"
+
+### Technical
+- Added v1.2.1 to version sequences in migration runners
+- Improved error handling for config parsing edge cases
+- Better user feedback during update process
+
+### Migration Notes (v1.0.0 → v1.2.1)
+**This release specifically fixes the v1.0.0 → v1.2.x upgrade path.**
+
+If you got this error on v1.2.0:
+```
+❌ tnl not configured. Run 'sudo tnl setup' first.
+```
+
+Now with v1.2.1:
+```bash
+sudo ./tnl update
+# Works! Automatically creates config.yml from systemd service
+```
+
 ## [1.2.0] - 2025-12-14
 
 ### Added

@@ -1,10 +1,10 @@
-# Tunnel Gateway Manager
+# tnld - Tunnel Daemon Infrastructure
 
 Self-hosted SSH reverse tunnel management system for exposing services behind NAT/firewall.
 
 ## Overview
 
-This project provides two complementary tools for managing SSH reverse tunnels:
+**tnld** provides two complementary tools for managing SSH reverse tunnels:
 
 - **gtwy** - Server-side gateway manager with automated DNS, SSL, and nginx configuration
 - **tnl** - Client-side tunnel manager for IT.Boxes
@@ -22,6 +22,7 @@ Perfect for self-hosted infrastructure where services need to be exposed through
 - 📊 **Multi-Domain** - Support for multiple domains and subdomains
 - 🗄️ **SQLite Database** - Built-in state management
 - 🔑 **SSH-based Auth** - Secure key-based authentication
+- 🔄 **Update Mechanism** - Preserve configuration across updates
 
 ### tnl (Tunnel Client)
 
@@ -29,6 +30,8 @@ Perfect for self-hosted infrastructure where services need to be exposed through
 - 🔄 **Persistent Tunnels** - systemd + autossh for reliability
 - 📡 **Admin Tunnel** - Reverse SSH access for management
 - ⚡ **Auto-Reconnect** - Automatic recovery from network issues
+- 🎯 **Service Tunnels** - Manage HTTP/HTTPS service tunnels dynamically
+- 🔄 **Update Mechanism** - Preserve configuration across updates
 
 ## Architecture
 
@@ -68,7 +71,7 @@ Perfect for self-hosted infrastructure where services need to be exposed through
 
 ```bash
 # Download gtwy
-curl -O https://github.com/yourusername/tunnel-gateway/releases/latest/download/gtwy
+curl -LO https://github.com/steedalot/tnld/releases/latest/download/gtwy
 chmod +x gtwy
 
 # Install (creates users, permissions, etc.)
@@ -85,7 +88,7 @@ sudo gtwy add-box box01 kibox.online '<ssh-public-key>'
 
 ```bash
 # Download tnl
-curl -O https://github.com/yourusername/tunnel-gateway/releases/latest/download/tnl
+curl -LO https://github.com/steedalot/tnld/releases/latest/download/tnl
 chmod +x tnl
 
 # Install (creates user, generates SSH key)
@@ -94,20 +97,44 @@ sudo ./tnl install
 
 # Setup tunnel (get admin_port from: gtwy get-port box01)
 sudo tnl setup gateway.example.com 20001
+
+# Add service tunnel (e.g., for Gitea)
+sudo tnl add gitea 3000
 ```
 
-**Done!** The admin tunnel is now running. From the gateway server:
+**Done!** The tunnels are now running. From the gateway server:
 
 ```bash
 ssh -p 20001 user@localhost  # SSH to the box
+```
+
+Access services via HTTPS:
+```
+https://gitea.box01.kibox.online
+```
+
+## Updating
+
+tnld supports seamless updates that preserve all configuration:
+
+```bash
+# Gateway
+curl -LO https://github.com/steedalot/tnld/releases/latest/download/gtwy
+chmod +x gtwy
+sudo ./gtwy update
+
+# Client
+curl -LO https://github.com/steedalot/tnld/releases/latest/download/tnl
+chmod +x tnl
+sudo ./tnl update
 ```
 
 ## Documentation
 
 - [gtwy Documentation](gtwy/README.md) - Server-side gateway manager
 - [tnl Documentation](tnl/README.md) - Client-side tunnel manager
-- [Testing Guide](docs/TESTING.md) - Complete testing workflow
-- [Technical Specification](docs/CLAUDE.md) - Architecture and implementation details
+- [CHANGELOG](CHANGELOG.md) - Version history and upgrade notes
+- [Project Structure](STRUCTURE.md) - Repository organization
 
 ## Requirements
 
@@ -125,13 +152,7 @@ ssh -p 20001 user@localhost  # SSH to the box
 - Python 3.8+
 - autossh
 - OpenSSH client
-
-## Installation
-
-See the Quick Start section above, or refer to:
-- [gtwy/README.md](gtwy/README.md) for detailed gateway setup
-- [tnl/README.md](tnl/README.md) for detailed client setup
-- [docs/TESTING.md](docs/TESTING.md) for complete testing guide
+- PyYAML (for service tunnel management)
 
 ## Use Cases
 
@@ -154,13 +175,23 @@ See the Quick Start section above, or refer to:
 
 This project uses [Semantic Versioning](https://semver.org/):
 
-- **v1.0.0** - Initial release (current)
-  - gtwy: install, setup, add-box, list-boxes, get-port, request, release
-  - tnl: install, setup, status
+- **v1.2.1** - Bugfix release (current)
+  - Fixed: v1.0.0 → v1.2.x update path
+  - Fixed: Configuration validation warnings
 
-- **v1.1.0** - Service tunnels (planned)
-  - tnl: add, remove, list commands
+- **v1.2.0** - Update mechanism
+  - gtwy/tnl: `update` command with automatic backups
+  - Enhanced box setup instructions
+
+- **v1.1.0** - Service tunnels
+  - tnl: `add`, `remove`, `list` commands
   - Dynamic service tunnel management
+
+- **v1.0.0** - Initial release
+  - gtwy: install, setup, box management, tunnel operations
+  - tnl: install, setup, admin tunnel
+
+See [CHANGELOG.md](CHANGELOG.md) for detailed version history.
 
 ## License
 
@@ -172,9 +203,9 @@ This is currently a private project for IT.Box infrastructure. Contributions, bu
 
 ## Support
 
-- **Documentation**: See [docs/](docs/) directory
-- **Issues**: GitHub Issues
-- **Testing**: See [docs/TESTING.md](docs/TESTING.md)
+- **Documentation**: See [CHANGELOG.md](CHANGELOG.md) and inline help (`gtwy --help`, `tnl --help`)
+- **Issues**: [GitHub Issues](https://github.com/steedalot/tnld/issues)
+- **Releases**: [GitHub Releases](https://github.com/steedalot/tnld/releases)
 
 ## Authors
 
@@ -182,4 +213,4 @@ Developed for the KI.Box / IT.Box infrastructure.
 
 ---
 
-**tunnel-gateway** - Simple. Robust. Self-hosted. 🚀
+**tnld** - Simple. Robust. Self-hosted. 🚀

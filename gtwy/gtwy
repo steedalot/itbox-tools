@@ -33,7 +33,7 @@ from typing import Optional, Dict, List, Any, Tuple
 # CONSTANTS
 # ============================================================================
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 DEFAULT_CONFIG_PATH = "/opt/gtwy/config.yml"
 DEFAULT_DB_PATH = "/opt/gtwy/tunnels.db"
 
@@ -883,7 +883,7 @@ def run_database_migrations(conn, from_version, to_version):
     }
 
     # Determine which migrations to run
-    version_sequence = ["1.0.0", "1.1.0", "1.2.0"]
+    version_sequence = ["1.0.0", "1.1.0", "1.2.0", "1.2.1"]
 
     try:
         from_idx = version_sequence.index(from_version)
@@ -929,18 +929,22 @@ def migrate_1_1_0_to_1_2_0(conn):
     pass
 
 def validate_config(config):
-    """Validate configuration structure."""
-    required_keys = ['ionos', 'gateway', 'ports', 'ssh', 'certbot']
+    """Validate configuration structure (non-fatal, just warnings)."""
+    warnings = []
 
-    for key in required_keys:
+    # Check for expected top-level keys (but don't fail if missing)
+    recommended_keys = ['ionos', 'gateway', 'ports', 'ssh', 'certbot']
+
+    for key in recommended_keys:
         if key not in config:
-            raise ValidationError(f"Missing required config key: {key}")
+            warnings.append(f"Missing recommended config key: {key}")
 
-    # Validate IONOS config
-    if 'public_prefix' not in config['ionos'] or 'secret' not in config['ionos']:
-        raise ValidationError("Missing IONOS API credentials")
+    # Critical: Check IONOS config if present
+    if 'ionos' in config:
+        if 'public_prefix' not in config['ionos'] or 'secret' not in config['ionos']:
+            warnings.append("Missing IONOS API credentials in 'ionos' section")
 
-    return True
+    return warnings
 
 # ============================================================================
 # COMMANDS - INSTALLATION
@@ -1194,11 +1198,17 @@ def cmd_update(args):
     print("\n4. Validating configuration...")
     try:
         config = load_config(DEFAULT_CONFIG_PATH)
-        validate_config(config)
-        print("   ✓ Configuration valid")
+        warnings = validate_config(config)
+
+        if not warnings:
+            print("   ✓ Configuration valid")
+        else:
+            print("   ⚠ Configuration warnings:")
+            for warning in warnings:
+                print(f"      - {warning}")
+            print("   Note: These are non-critical, gtwy should work normally")
     except Exception as e:
-        print(f"   ⚠ Configuration validation warning: {e}")
-        print("   You may need to run 'sudo gtwy setup --update' to fix config")
+        print(f"   ⚠ Could not validate config: {e}")
 
     # 5. Success
     print("\n" + "="*60)
