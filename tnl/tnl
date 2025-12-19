@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 # CONSTANTS
 # ============================================================================
 
-VERSION = "1.2.2"
+VERSION = "1.2.6"
 TUNNELUSER = "tunneluser"
 TUNNELUSER_HOME = "/home/tunneluser"
 SSH_KEY_PATH = f"{TUNNELUSER_HOME}/.ssh/tunnel_key"
@@ -263,11 +263,11 @@ def run_config_migrations(config, from_version, to_version):
 
     Note: Only supports migrations from last stable (1.2.1) to current.
     """
-    # Config migrations (none needed for 1.2.1→1.2.2)
+    # Config migrations (none needed for 1.2.1→1.2.6)
     migrations = {}
 
     # Supported version sequence (only last stable → current)
-    version_sequence = ["1.2.1", "1.2.2"]
+    version_sequence = ["1.2.1", "1.2.2", "1.2.6"]
 
     try:
         from_idx = version_sequence.index(from_version)
@@ -449,38 +449,15 @@ def cmd_update(args):
 
     print(f"   ✓ Backup created: {backup_dir}")
 
-    # 2. Stop running services
-    print("\n2. Stopping services...")
-    services = ["tnl-admin.service"]
-
-    # Find all tnl-* services
-    result = run_command(
-        ["systemctl", "list-units", "tnl-*.service", "--no-legend", "--all"],
-        capture_output=True,
-        check=False
-    )
-
-    if result.returncode == 0:
-        for line in result.stdout.splitlines():
-            if line.strip():
-                service = line.split()[0]
-                if service not in services:
-                    services.append(service)
-
-    for service in services:
-        run_command(["systemctl", "stop", service], check=False)
-
-    print(f"   ✓ {len(services)} service(s) stopped")
-
-    # 3. Install new executable
-    print("\n3. Installing new version...")
+    # 2. Install new executable
+    print("\n2. Installing new version...")
     current_script = Path(__file__).resolve()
     shutil.copy2(current_script, "/usr/local/bin/tnl")
     os.chmod("/usr/local/bin/tnl", 0o755)
     print("   ✓ Executable updated")
 
-    # 4. Migrate config if needed
-    print("\n4. Migrating configuration...")
+    # 3. Migrate config if needed
+    print("\n3. Migrating configuration...")
 
     # For v1.0.0 → v1.2.0: config.yml doesn't exist yet, need to create it
     if not Path(TNL_CONFIG_FILE).exists():
@@ -524,32 +501,13 @@ def cmd_update(args):
     else:
         print("   ✓ Configuration up to date")
 
-    # 5. Restart services
-    print("\n5. Restarting services...")
-    for service in services:
-        run_command(["systemctl", "start", service], check=False)
-
-    # Wait and check status
-    import time
-    time.sleep(2)
-
-    active = 0
-    for service in services:
-        result = run_command(
-            ["systemctl", "is-active", service],
-            check=False,
-            capture_output=True
-        )
-        if result.stdout.strip() == "active":
-            active += 1
-
-    print(f"   ✓ {active}/{len(services)} service(s) active")
-
-    # 6. Success
+    # 4. Success
     print("\n" + "="*60)
     print(f"✓ tnl updated successfully: {installed_version} → {current_version}")
     print("="*60)
     print(f"\nBackup stored at: {backup_dir}")
+    print(f"\nServices are still running - no restart required!")
+    print("The update is active for all new 'tnl' commands.")
     print("\nChangelog: https://github.com/steedalot/tnld/releases")
 
 def cmd_setup(args):
