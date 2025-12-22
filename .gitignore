@@ -68,6 +68,7 @@ tunnels.db
 # Documentation drafts (exclude from repo)
 documentation/
 legacy/
+docs/
 
 # Backup files
 *.bak

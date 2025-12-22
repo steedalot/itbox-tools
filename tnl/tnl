@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """
 tnl - Tunnel Client for IT.Box
+Version 1.2.6
+
 Simple client-side tool to manage SSH reverse tunnels to gateway server.
+
+Author: steedalot
+License: MIT
 """
 
 import os
