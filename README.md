@@ -16,6 +16,7 @@ Perfect for self-hosted infrastructure where services need to be exposed through
 ### gtwy (Gateway Server)
 
 - 🔧 **Automated Setup** - One-command installation and configuration
+- 📦 **Single-File Tool** - No external dependencies or config files needed
 - 🌐 **DNS Automation** - IONOS DNS API integration
 - 🔒 **SSL Certificates** - Automatic Let's Encrypt certificate management
 - 🔄 **nginx Integration** - Dynamic reverse proxy configuration
@@ -27,28 +28,30 @@ Perfect for self-hosted infrastructure where services need to be exposed through
 ### tnl (Tunnel Client)
 
 - 🚀 **Easy Installation** - Automated user and key setup
+- 📦 **Single-File Tool** - No external dependencies needed
 - 🔄 **Persistent Tunnels** - systemd + autossh for reliability
 - 📡 **Admin Tunnel** - Reverse SSH access for management
-- ⚡ **Auto-Reconnect** - Automatic recovery from network issues
 - 🎯 **Service Tunnels** - Manage HTTP/HTTPS service tunnels dynamically
+- ⚡ **Auto-Reconnect** - Automatic recovery from network issues
+- 🔑 **SSH-based Auth** - Secure key-based authentication
 - 🔄 **Update Mechanism** - Preserve configuration across updates
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                   IT.Box (Client)                   │
+┌────────────────────────────────────────────────────┐
+│                   IT.Box (Client)                  │
 │  ┌──────────────────────────────────────────────┐  │
-│  │  Services: Gitea, Theia, Portainer, etc.    │  │
+│  │  Services: Gitea, Theia, Portainer, etc.     │  │
 │  │  Ports: 3000, 8080, 9000, ...                │  │
 │  │  tnl - Tunnel Client                         │  │
 │  └────────────────┬─────────────────────────────┘  │
 │                   │ SSH Reverse Tunnel             │
-└───────────────────┼─────────────────────────────────┘
+└───────────────────┼────────────────────────────────┘
                     │
                     ▼
-┌─────────────────────────────────────────────────────┐
-│              Gateway Server (gtwy)                  │
+┌────────────────────────────────────────────────────┐
+│              Gateway Server (gtwy)                 │
 │  ┌──────────────────────────────────────────────┐  │
 │  │  gtwy - Gateway Manager                      │  │
 │  │  - SSH tunnels (ports 10000-19999)           │  │
@@ -56,7 +59,7 @@ Perfect for self-hosted infrastructure where services need to be exposed through
 │  │  - Let's Encrypt SSL                         │  │
 │  │  - IONOS DNS automation                      │  │
 │  └────────────────┬─────────────────────────────┘  │
-└───────────────────┼─────────────────────────────────┘
+└───────────────────┼────────────────────────────────┘
                     │
                     ▼
               🌍 Internet
