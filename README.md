@@ -1,216 +1,123 @@
-# tnld - Tunnel Daemon Infrastructure
+# IT.Box Tools
 
-Self-hosted SSH reverse tunnel management system for exposing services behind NAT/firewall.
+Collection of management tools for the IT.Box infrastructure - a decentralized educational platform for schools in Lower Saxony, Germany.
 
-## Overview
+## 🛠️ Tools
 
-**tnld** provides two complementary tools for managing SSH reverse tunnels:
+### Infrastructure & Tunneling
 
-- **gtwy** - Server-side gateway manager with automated DNS, SSL, and nginx configuration
-- **tnl** - Client-side tunnel manager for IT.Boxes
+- **[gtwy](gtwy/)** - Gateway server for SSH reverse tunnels with automated DNS, SSL, and nginx configuration
+- **[tnl](tnl/)** - Client-side tunnel manager for IT.Boxes
 
-Perfect for self-hosted infrastructure where services need to be exposed through a central gateway server.
+### Container Management
 
-## Features
+- **[boxctl](boxctl/)** - Docker container management for IT.Box with automatic docker-compose generation
+- **[catalogctl](catalogctl/)** - Container catalog management for publishing containers to IT.Boxes
 
-### gtwy (Gateway Server)
+### Authentication & Security
 
-- 🔧 **Automated Setup** - One-command installation and configuration
-- 📦 **Single-File Tool** - No external dependencies or config files needed
-- 🌐 **DNS Automation** - IONOS DNS API integration
-- 🔒 **SSL Certificates** - Automatic Let's Encrypt certificate management
-- 🔄 **nginx Integration** - Dynamic reverse proxy configuration
-- 📊 **Multi-Domain** - Support for multiple domains and subdomains
-- 🗄️ **SQLite Database** - Built-in state management
-- 🔑 **SSH-based Auth** - Secure key-based authentication
-- 🔄 **Update Mechanism** - Preserve configuration across updates
+- **[mnchk](mnchk/)** - Credential checker for moin.schule SSO integration
 
-### tnl (Tunnel Client)
+## 📦 Quick Overview
 
-- 🚀 **Easy Installation** - Automated user and key setup
-- 📦 **Single-File Tool** - No external dependencies needed
-- 🔄 **Persistent Tunnels** - systemd + autossh for reliability
-- 📡 **Admin Tunnel** - Reverse SSH access for management
-- 🎯 **Service Tunnels** - Manage HTTP/HTTPS service tunnels dynamically
-- ⚡ **Auto-Reconnect** - Automatic recovery from network issues
-- 🔑 **SSH-based Auth** - Secure key-based authentication
-- 🔄 **Update Mechanism** - Preserve configuration across updates
+| Tool | Purpose | Run On | Version |
+|------|---------|--------|---------|
+| gtwy | SSH tunnel gateway with DNS/SSL automation | Gateway Server | 2.0.0 |
+| tnl | Tunnel client for IT.Boxes | IT.Box | 2.0.0 |
+| boxctl | Container lifecycle management | IT.Box | 2.0.0 |
+| catalogctl | Container catalog server | Catalog Server | 2.0.0 |
+| mnchk | moin.schule credential validation | IT.Box | 2.0.0 |
 
-## Architecture
+## 🚀 Getting Started
+
+Each tool has its own comprehensive documentation in its subdirectory. Click on the tool name above to access detailed installation instructions, usage examples, and API documentation.
+
+### Typical Workflow
+
+1. **Gateway Setup**: Install `gtwy` on your gateway server
+2. **Box Setup**: Install `tnl` on each IT.Box
+3. **Container Setup**: Install `boxctl` on IT.Boxes for container management
+4. **Catalog Setup**: Install `catalogctl` on your catalog server (optional)
+5. **Authentication**: Use `mnchk` for moin.schule SSO integration (optional)
+
+## 📚 Documentation
+
+- [gtwy Documentation](gtwy/README.md) - Gateway server management
+- [tnl Documentation](tnl/README.md) - Tunnel client management
+- [boxctl Documentation](boxctl/README.md) - Container management
+- [catalogctl Documentation](catalogctl/README.md) - Catalog server management
+- [mnchk Documentation](mnchk/README.md) - Credential checking
+
+## 🏗️ Architecture
 
 ```
-┌────────────────────────────────────────────────────┐
-│                   IT.Box (Client)                  │
-│  ┌──────────────────────────────────────────────┐  │
-│  │  Services: Gitea, Theia, Portainer, etc.     │  │
-│  │  Ports: 3000, 8080, 9000, ...                │  │
-│  │  tnl - Tunnel Client                         │  │
-│  └────────────────┬─────────────────────────────┘  │
-│                   │ SSH Reverse Tunnel             │
-└───────────────────┼────────────────────────────────┘
-                    │
-                    ▼
-┌────────────────────────────────────────────────────┐
-│              Gateway Server (gtwy)                 │
-│  ┌──────────────────────────────────────────────┐  │
-│  │  gtwy - Gateway Manager                      │  │
-│  │  - SSH tunnels (ports 10000-19999)           │  │
-│  │  - nginx reverse proxy                       │  │
-│  │  - Let's Encrypt SSL                         │  │
-│  │  - IONOS DNS automation                      │  │
-│  └────────────────┬─────────────────────────────┘  │
-└───────────────────┼────────────────────────────────┘
-                    │
-                    ▼
-              🌍 Internet
-    https://gitea.box01.kibox.online
-    https://theia.box01.kibox.online
-    https://portainer.box01.kibox.online
+┌─────────────────────────────────────────────┐
+│          IT.Box (Raspberry Pi 5)            │
+│  ┌───────────────────────────────────────┐  │
+│  │  boxctl - Container Management        │  │
+│  │  - Gitea, Portainer, Open-WebUI       │  │
+│  │  - Docker Compose automation          │  │
+│  └───────────────────────────────────────┘  │
+│  ┌───────────────────────────────────────┐  │
+│  │  tnl - Tunnel Client                  │  │
+│  │  - SSH reverse tunnels                │  │
+│  │  - Service exposure                   │  │
+│  └─────────────┬─────────────────────────┘  │
+└────────────────┼────────────────────────────┘
+                 │ SSH Tunnels
+                 ▼
+┌─────────────────────────────────────────────┐
+│         Gateway Server (VPS/Cloud)          │
+│  ┌───────────────────────────────────────┐  │
+│  │  gtwy - Gateway Manager               │  │
+│  │  - nginx reverse proxy                │  │
+│  │  - Let's Encrypt SSL                  │  │
+│  │  - IONOS DNS automation               │  │
+│  └───────────────────────────────────────┘  │
+└─────────────────────────────────────────────┘
+                 │
+                 ▼
+        🌍 Public Internet
+  https://gitea.box01.kibox.online
+  https://portainer.box01.kibox.online
 ```
 
-## Quick Start
+## ⚙️ Requirements
 
-### Server Setup (Gateway)
-
-```bash
-# Download gtwy
-curl -LO https://github.com/steedalot/tnld/releases/latest/download/gtwy
-chmod +x gtwy
-
-# Install (creates users, permissions, etc.)
-sudo ./gtwy install
-
-# Configure (interactive wizard)
-sudo gtwy setup
-
-# Add a box
-sudo gtwy add-box box01 kibox.online '<ssh-public-key>'
-```
-
-### Client Setup (IT.Box)
-
-```bash
-# Download tnl
-curl -LO https://github.com/steedalot/tnld/releases/latest/download/tnl
-chmod +x tnl
-
-# Install (creates user, generates SSH key)
-sudo ./tnl install
-# Copy the displayed public key and register on gateway
-
-# Setup tunnel (get admin_port from: gtwy get-port box01)
-sudo tnl setup gateway.example.com 20001
-
-# Add service tunnel (e.g., for Gitea)
-sudo tnl add gitea 3000
-```
-
-**Done!** The tunnels are now running. From the gateway server:
-
-```bash
-ssh -p 20001 user@localhost  # SSH to the box
-```
-
-Access services via HTTPS:
-```
-https://gitea.box01.kibox.online
-```
-
-## Updating
-
-tnld supports seamless updates that preserve all configuration:
-
-```bash
-# Gateway
-curl -LO https://github.com/steedalot/tnld/releases/latest/download/gtwy
-chmod +x gtwy
-sudo ./gtwy update
-
-# Client
-curl -LO https://github.com/steedalot/tnld/releases/latest/download/tnl
-chmod +x tnl
-sudo ./tnl update
-```
-
-## Documentation
-
-- [gtwy Documentation](gtwy/README.md) - Server-side gateway manager
-- [tnl Documentation](tnl/README.md) - Client-side tunnel manager
-- [CHANGELOG](CHANGELOG.md) - Version history and upgrade notes
-
-## Requirements
-
-### Gateway Server
-
-- Ubuntu/Debian Linux
+### Common Requirements
 - Python 3.8+
-- nginx
-- certbot (Let's Encrypt)
-- IONOS account with DNS API access
-
-### IT.Box (Client)
-
 - Ubuntu/Debian Linux
-- Python 3.8+
-- autossh
-- OpenSSH client
-- PyYAML (for service tunnel management)
 
-## Use Cases
+### Tool-Specific Requirements
+See individual tool READMEs for detailed requirements.
 
-- **Self-hosted Services** - Expose Gitea, Nextcloud, etc. from behind NAT
-- **IoT Devices** - Manage devices without public IPs
-- **Remote Development** - Access code-server/Theia instances
-- **Multi-tenant Hosting** - Separate domains per box
-- **Educational Institutions** - School IT.Boxes with centralized gateway
+## 📝 Version History
 
-## Security
+All tools are currently at version **2.0.0** with the following unified features:
 
-- SSH key-based authentication only
-- Command restriction in authorized_keys (no shell access)
-- Automatic SSL/TLS via Let's Encrypt
-- GatewayPorts disabled (tunnels only accessible from gateway)
-- Minimal sudo permissions for tunnel operations
-- Separation of admin tunnels (SSH) and service tunnels (HTTP/HTTPS)
+- ✅ Single-file tools (no external config files needed)
+- ✅ Self-installing with `sudo <tool> install`
+- ✅ Comprehensive error handling
+- ✅ Detailed logging
+- ✅ Zero-downtime updates
+- ✅ HTTP Basic Authentication support (gtwy/tnl)
+- ✅ Automated migrations
 
-## Versioning
+See individual tool CHANGELOGs for detailed version histories.
 
-This project uses [Semantic Versioning](https://semver.org/):
+## 📄 License
 
-- **v1.2.6** - Automatic tunnel finalization & zero-downtime updates (current)
-  - Fixed automatic SSL certificate provisioning
-  - Fixed DNS record cleanup
-  - Zero-downtime updates (services continue running)
-  - All operations properly logged
+MIT License
 
-- **v1.2.1** - Bugfix release
-  - Fixed: v1.0.0 → v1.2.x update path
-  - Fixed: Multiple permission issues
+## 👨‍💻 Authors
 
-- **v1.2.0** - Update mechanism
-  - gtwy/tnl: `update` command with automatic backups
-  - Enhanced box setup instructions
+Developed for the IT.Box / KI.Box infrastructure in Lower Saxony, Germany.
 
-See [CHANGELOG.md](CHANGELOG.md) for detailed version history.
+## 🔗 Links
 
-## License
-
-MIT License - See [LICENSE](LICENSE)
-
-## Contributing
-
-This is currently a private project for IT.Box infrastructure. Contributions, bug reports, and feature requests are welcome via GitHub issues.
-
-## Support
-
-- **Documentation**: See [CHANGELOG.md](CHANGELOG.md) and inline help (`gtwy --help`, `tnl --help`)
-- **Issues**: [GitHub Issues](https://github.com/steedalot/tnld/issues)
-- **Releases**: [GitHub Releases](https://github.com/steedalot/tnld/releases)
-
-## Authors
-
-Developed for the KI.Box / IT.Box infrastructure.
+- [IT.Box Project](https://github.com/n-21/itbox)
+- [moin.schule Platform](https://moin.schule)
 
 ---
 
-**tnld** - Simple. Robust. Self-hosted. 🚀
+**IT.Box Tools** - Simple. Robust. Educational. 🚀

@@ -167,13 +167,90 @@ Jan 15 14:23:46 box01 autossh[12345]: starting ssh ...
 
 ---
 
+### `sudo tnl add <service> <local-port>`
+
+**Service-Tunnel hinzufügen**
+
+Erstellt einen persistenten Tunnel für einen Service (z.B. Gitea, Theia).
+
+```bash
+sudo tnl add gitea 3000
+sudo tnl add theia 8080
+```
+
+---
+
+### `sudo tnl remove <service>`
+
+**Service-Tunnel entfernen**
+
+```bash
+sudo tnl remove gitea
+```
+
+---
+
+### `sudo tnl list`
+
+**Alle Service-Tunnels anzeigen**
+
+```bash
+sudo tnl list
+```
+
+---
+
+### `sudo tnl enable-auth <service> <username> <password>`
+
+**HTTP-Authentifizierung aktivieren** (v2.0)
+
+Schützt einen Service mit HTTP Basic Auth.
+
+```bash
+sudo tnl enable-auth gitea admin secretpass
+```
+
+Optional mit eigenem Realm:
+```bash
+sudo tnl enable-auth gitea admin secretpass --realm "Gitea Access"
+```
+
+---
+
+### `sudo tnl disable-auth <service>`
+
+**HTTP-Authentifizierung deaktivieren** (v2.0)
+
+```bash
+sudo tnl disable-auth gitea
+```
+
+---
+
+### `sudo tnl update`
+
+**tnl auf neue Version aktualisieren** (v2.0)
+
+Zero-downtime Update mit automatischer Config-Migration.
+
+```bash
+sudo tnl update
+```
+
+Mit Force-Flag (bei gleicher Version):
+```bash
+sudo tnl update --force
+```
+
+---
+
 ### `tnl version`
 
 **Version anzeigen**
 
 ```bash
 tnl version
-# → tnl v1.2.6
+# → tnl v2.0.0
 ```
 
 ---
@@ -213,8 +290,12 @@ tnl version
     ├── tunnel_key         # Private key
     └── tunnel_key.pub     # Public key
 
+/etc/tnl/
+└── config.yml             # Konfiguration (Gateway IP, Ports, Tunnels)
+
 /etc/systemd/system/
-└── tnl-admin.service      # systemd service
+├── tnl-admin.service      # Admin-SSH-Tunnel
+└── tnl-*.service          # Service-Tunnels (gitea, theia, etc.)
 
 /usr/local/bin/
 └── tnl                    # Command (global)
@@ -463,12 +544,13 @@ sudo tnl list
 
 Siehe [CHANGELOG.md](../CHANGELOG.md) im Hauptverzeichnis für vollständige Versionshistorie.
 
-### v1.2.6 (current)
-- ✅ Zero-downtime updates
+### v2.0.0 (current)
+- ✅ HTTP Basic Authentication für Service-Tunnels (`enable-auth`, `disable-auth`)
+- ✅ Zero-downtime update mechanism (`update`)
 - ✅ Service tunnels management (`add`, `remove`, `list`)
-- ✅ Admin tunnel setup
-- ✅ Automatic reconnection
-- ✅ Update mechanism with configuration preservation
+- ✅ Admin tunnel setup mit automatischer Konfiguration
+- ✅ Automatic reconnection via autossh
+- ✅ Configuration preservation during updates
 
 ---
 

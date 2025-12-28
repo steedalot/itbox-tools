@@ -14,6 +14,8 @@
 - 🔑 **SSH-basiert** - Sichere Authentifizierung über SSH Public Keys
 - 📊 **SQLite-basiert** - Keine externe Datenbank nötig
 - 🔄 **Port-Management** - Automatische Port-Allokation
+- 🔐 **HTTP Basic Auth** - Optionaler Passwortschutz für Tunnels (v2.0)
+- 🔄 **Zero-Downtime Updates** - Automatische Migration ohne Service-Unterbrechung (v2.0)
 
 ---
 
@@ -63,6 +65,7 @@ autossh -M 0 -f -N -R $PORT:localhost:3000 \
 ### Installation & Setup
 ```bash
 gtwy install          # Einmalige Installation (User, Gruppen, Permissions)
+gtwy update           # Update auf neue Version (v2.0)
 gtwy setup            # Interaktiver Konfigurations-Wizard
 gtwy version          # Version anzeigen
 ```
@@ -79,14 +82,23 @@ gtwy get-port <id>                  # Admin-SSH-Port abrufen
 ```bash
 gtwy request <service> <port>       # Tunnel anfordern (von Box)
 gtwy release <service>              # Tunnel freigeben (von Box)
+gtwy finalize-tunnel <subdomain>    # Tunnel finalisieren (DNS+SSL) (v2.0)
 gtwy list                           # Alle Tunnels anzeigen
 gtwy info <subdomain>               # Tunnel-Details
 gtwy remove <subdomain>             # Tunnel entfernen (Admin)
 ```
 
+### HTTP-Authentifizierung (v2.0)
+```bash
+gtwy enable-auth <subdomain> <user> <pass>    # HTTP Auth aktivieren
+gtwy disable-auth <subdomain>                 # HTTP Auth deaktivieren
+gtwy update-auth <subdomain> <user> <pass>    # HTTP Auth aktualisieren
+```
+
 ### Monitoring
 ```bash
 gtwy status                         # Tunnel-Health-Check
+gtwy check-tunnels                  # Alle Tunnels auf Aktivität prüfen (v2.0)
 gtwy stats                          # Statistiken
 gtwy health                         # System-Health-Check
 gtwy test-tunnel <subdomain>        # End-to-End Test
@@ -158,12 +170,13 @@ Beispiele:
 ├── gtwy                    # Haupt-Script (single file!)
 ├── config.yml             # Konfiguration
 ├── tunnels.db             # SQLite-Datenbank
-├── nginx-template         # nginx Server-Block Template
 ├── gtwy.log               # Log-Datei
-└── backups/               # Backups
+├── backups/               # Backups
+└── nginx-configs/         # nginx-Konfiguration (v2.0)
+    └── tunnels-autogen.conf   # Auto-generiert (nicht manuell editieren!)
 
 /etc/nginx/sites-enabled/
-└── tunnels-autogen.conf   # Auto-generiert (nicht manuell editieren!)
+└── tunnels-autogen.conf   # Symlink → /opt/gtwy/nginx-configs/tunnels-autogen.conf
 
 /home/tunneluser/.ssh/
 └── authorized_keys        # Verwaltet von gtwy
@@ -386,10 +399,14 @@ curl -H "X-API-Key: PREFIX.SECRET" https://api.hosting.ionos.com/dns/v1/zones
 
 Siehe [CHANGELOG.md](../CHANGELOG.md) im Hauptverzeichnis für vollständige Versionshistorie.
 
-### v1.2.6 (current)
-- Fixed automatic SSL certificate provisioning
-- Fixed DNS record cleanup
-- Zero-downtime updates
+### v2.0.0 (current)
+- ✅ HTTP Basic Authentication für Tunnels (`enable-auth`, `disable-auth`, `update-auth`)
+- ✅ Automatic tunnel finalization (`finalize-tunnel`)
+- ✅ Zero-downtime update mechanism (`update`)
+- ✅ Tunnel health checks (`check-tunnels`)
+- ✅ Fixed automatic SSL certificate provisioning
+- ✅ Fixed DNS record cleanup
+- ✅ Configuration migrations and validation
 
 ---
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 tnl - Tunnel Client for IT.Box
-Version 1.2.6
+Version 2.0.0
 
 Simple client-side tool to manage SSH reverse tunnels to gateway server.
 
@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 # CONSTANTS
 # ============================================================================
 
-VERSION = "1.2.6"
+VERSION = "2.0.0"
 TUNNELUSER = "tunneluser"
 TUNNELUSER_HOME = "/home/tunneluser"
 SSH_KEY_PATH = f"{TUNNELUSER_HOME}/.ssh/tunnel_key"
@@ -881,6 +881,135 @@ def cmd_list(args):
     total = len(tunnels)
     print(f"\nTotal: {total} tunnel(s) ({active_count} active, {inactive_count} inactive)")
 
+def cmd_enable_auth(args):
+    """Enable HTTP Basic Authentication for a service tunnel."""
+    check_root()
+
+    service = args.service
+    username = args.username
+    password = args.password
+    realm = args.realm if hasattr(args, 'realm') and args.realm else "Restricted Area"
+
+    print(f"🔐 Enabling HTTP Auth for '{service}'\n")
+
+    # 1. Load config and verify tunnel exists
+    try:
+        config = load_config()
+    except TnlError as e:
+        print(f"❌ {e}")
+        sys.exit(1)
+
+    tunnels = config.get('tunnels', {})
+
+    if service not in tunnels:
+        print(f"❌ Error: Tunnel '{service}' not found")
+        print(f"   Run: sudo tnl list")
+        sys.exit(1)
+
+    gateway = config.get('gateway', {})
+    gateway_ip = gateway.get('ip')
+    gateway_ssh_port = gateway.get('ssh_port', 22)
+
+    if not gateway_ip:
+        print("❌ Error: Gateway not configured")
+        sys.exit(1)
+
+    print(f"   ✓ Found tunnel: {service}")
+    print(f"   Subdomain: {tunnels[service]['subdomain']}")
+
+    # 2. Call gateway enable-auth command via SSH
+    print("\nEnabling auth on gateway...")
+
+    try:
+        cmd = f"ssh -i {SSH_KEY_PATH} -p {gateway_ssh_port} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null tunneluser@{gateway_ip} gtwy enable-auth $(hostname) {service} {username} '{password}' --realm '{realm}'"
+        result = subprocess.run(
+            cmd,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+
+        if result.returncode != 0:
+            print(f"❌ Gateway command failed: {result.stderr}")
+            sys.exit(1)
+
+        print(result.stdout)
+        print("\n" + "="*60)
+        print(f"✓ HTTP Auth enabled for '{service}'")
+        print(f"  Username: {username}")
+        print(f"  Realm: {realm}")
+        print("="*60)
+
+    except subprocess.TimeoutExpired:
+        print("❌ Error: Gateway command timed out")
+        sys.exit(1)
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        sys.exit(1)
+
+def cmd_disable_auth(args):
+    """Disable HTTP Basic Authentication for a service tunnel."""
+    check_root()
+
+    service = args.service
+
+    print(f"🔓 Disabling HTTP Auth for '{service}'\n")
+
+    # 1. Load config and verify tunnel exists
+    try:
+        config = load_config()
+    except TnlError as e:
+        print(f"❌ {e}")
+        sys.exit(1)
+
+    tunnels = config.get('tunnels', {})
+
+    if service not in tunnels:
+        print(f"❌ Error: Tunnel '{service}' not found")
+        print(f"   Run: sudo tnl list")
+        sys.exit(1)
+
+    gateway = config.get('gateway', {})
+    gateway_ip = gateway.get('ip')
+    gateway_ssh_port = gateway.get('ssh_port', 22)
+
+    if not gateway_ip:
+        print("❌ Error: Gateway not configured")
+        sys.exit(1)
+
+    print(f"   ✓ Found tunnel: {service}")
+    print(f"   Subdomain: {tunnels[service]['subdomain']}")
+
+    # 2. Call gateway disable-auth command via SSH
+    print("\nDisabling auth on gateway...")
+
+    try:
+        cmd = f"ssh -i {SSH_KEY_PATH} -p {gateway_ssh_port} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null tunneluser@{gateway_ip} gtwy disable-auth $(hostname) {service}"
+        result = subprocess.run(
+            cmd,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+
+        if result.returncode != 0:
+            print(f"❌ Gateway command failed: {result.stderr}")
+            sys.exit(1)
+
+        print(result.stdout)
+        print("\n" + "="*60)
+        print(f"✓ HTTP Auth disabled for '{service}'")
+        print("="*60)
+
+    except subprocess.TimeoutExpired:
+        print("❌ Error: Gateway command timed out")
+        sys.exit(1)
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        sys.exit(1)
+
 def cmd_version(args):
     """Show version."""
     print(f"tnl v{VERSION}")
@@ -949,6 +1078,25 @@ def build_parser():
         help='List all service tunnels'
     )
     p_list.set_defaults(func=cmd_list)
+
+    # enable-auth (v2.0)
+    p_enable_auth = subparsers.add_parser(
+        'enable-auth',
+        help='Enable HTTP auth for service tunnel'
+    )
+    p_enable_auth.add_argument('service', help='Service name')
+    p_enable_auth.add_argument('username', help='Auth username')
+    p_enable_auth.add_argument('password', help='Auth password')
+    p_enable_auth.add_argument('--realm', help='Auth realm (default: Restricted Area)')
+    p_enable_auth.set_defaults(func=cmd_enable_auth)
+
+    # disable-auth (v2.0)
+    p_disable_auth = subparsers.add_parser(
+        'disable-auth',
+        help='Disable HTTP auth for service tunnel'
+    )
+    p_disable_auth.add_argument('service', help='Service name')
+    p_disable_auth.set_defaults(func=cmd_disable_auth)
 
     # status
     p_status = subparsers.add_parser(

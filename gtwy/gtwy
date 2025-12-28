@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 gtwy - Tunnel Gateway Manager
-Version 1.2.6
+Version 2.0.0
 
 A tool for managing SSH reverse tunnels from remote IT.Boxes to a central
 nginx gateway server with automated DNS and SSL certificate management.
@@ -34,7 +34,7 @@ from typing import Optional, Dict, List, Any, Tuple
 # CONSTANTS
 # ============================================================================
 
-VERSION = "1.2.6"
+VERSION = "2.0.0"
 DEFAULT_CONFIG_PATH = "/opt/gtwy/config.yml"
 DEFAULT_DB_PATH = "/opt/gtwy/tunnels.db"
 
@@ -118,6 +118,117 @@ server {
 
     # Proxy settings
     location / {
+        proxy_pass http://localhost:{SERVER_PORT};
+        proxy_http_version 1.1;
+
+        # WebSocket support
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+
+        # Standard proxy headers
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Timeouts
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+    }
+
+    # Increase upload size for file uploads
+    client_max_body_size 100M;
+}
+"""
+
+# HTTP-only template with HTTP Auth for tunnels pending certificate
+NGINX_TEMPLATE_HTTP_AUTH = """# Tunnel: {SUBDOMAIN} (pending certificate, with HTTP auth)
+# Port: {SERVER_PORT}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name {SUBDOMAIN};
+
+    # ACME challenge location for Let's Encrypt (must come before auth!)
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
+
+    # Proxy settings with HTTP Basic Auth
+    location / {
+        # HTTP Basic Authentication
+        auth_basic "{AUTH_REALM}";
+        auth_basic_user_file {HTPASSWD_FILE};
+
+        proxy_pass http://localhost:{SERVER_PORT};
+        proxy_http_version 1.1;
+
+        # WebSocket support
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+
+        # Standard proxy headers
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Timeouts
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+    }
+
+    # Increase upload size for file uploads
+    client_max_body_size 100M;
+}
+"""
+
+# SSL template with HTTP Auth for active tunnels with certificate
+NGINX_TEMPLATE_SSL_AUTH = """# Tunnel: {SUBDOMAIN} (active with SSL and HTTP auth)
+# Port: {SERVER_PORT}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name {SUBDOMAIN};
+
+    # ACME challenge location for Let's Encrypt renewals
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
+
+    # Redirect HTTP to HTTPS
+    location / {
+        return 301 https://$server_name$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name {SUBDOMAIN};
+
+    # SSL certificates (managed by certbot)
+    ssl_certificate /etc/letsencrypt/live/{SUBDOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/{SUBDOMAIN}/privkey.pem;
+
+    # SSL settings (inline to avoid dependency on certbot-installed files)
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers 'ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384';
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 10m;
+
+    # Proxy settings with HTTP Basic Auth
+    location / {
+        # HTTP Basic Authentication
+        auth_basic "{AUTH_REALM}";
+        auth_basic_user_file {HTPASSWD_FILE};
+
         proxy_pass http://localhost:{SERVER_PORT};
         proxy_http_version 1.1;
 
@@ -336,6 +447,13 @@ def get_db_connection(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     return conn
 
+def row_get(row: sqlite3.Row, key: str, default=None):
+    """Safely get value from sqlite3.Row with default fallback."""
+    try:
+        return row[key]
+    except (KeyError, IndexError):
+        return default
+
 # ============================================================================
 # VALIDATION
 # ============================================================================
@@ -517,9 +635,13 @@ def generate_subdomain(conn: sqlite3.Connection, service: str, box_id: str) -> s
 def generate_nginx_config(conn: sqlite3.Connection, template_path: str = None) -> str:
     """Generate complete nginx configuration from database.
 
-    Uses different templates based on tunnel status:
-    - pending_cert: HTTP-only (NGINX_TEMPLATE_HTTP)
-    - active: HTTPS with redirect (NGINX_TEMPLATE_SSL)
+    Uses different templates based on tunnel status and HTTP auth configuration:
+    - pending_cert + no auth: HTTP-only (NGINX_TEMPLATE_HTTP)
+    - pending_cert + auth: HTTP-only with auth (NGINX_TEMPLATE_HTTP_AUTH)
+    - active + no auth: HTTPS with redirect (NGINX_TEMPLATE_SSL)
+    - active + auth: HTTPS with redirect and auth (NGINX_TEMPLATE_SSL_AUTH)
+
+    Automatically generates htpasswd files for tunnels with HTTP auth enabled.
 
     Note: template_path parameter is kept for backward compatibility but ignored.
     """
@@ -528,15 +650,46 @@ def generate_nginx_config(conn: sqlite3.Connection, template_path: str = None) -
     tunnels = cursor.fetchall()
 
     config_blocks = []
-    for tunnel in tunnels:
-        # Choose template based on status
-        if tunnel['status'] == 'pending_cert':
-            template = NGINX_TEMPLATE_HTTP
-        else:  # active or any other status
-            template = NGINX_TEMPLATE_SSL
+    htpasswd_base_dir = Path("/opt/gtwy/htpasswd")
 
+    for tunnel in tunnels:
+        # Check if HTTP auth is enabled
+        http_auth_enabled = row_get(tunnel, 'http_auth_enabled', 0)
+
+        # Choose template based on status and auth
+        if tunnel['status'] == 'pending_cert':
+            if http_auth_enabled:
+                template = NGINX_TEMPLATE_HTTP_AUTH
+            else:
+                template = NGINX_TEMPLATE_HTTP
+        else:  # active or any other status
+            if http_auth_enabled:
+                template = NGINX_TEMPLATE_SSL_AUTH
+            else:
+                template = NGINX_TEMPLATE_SSL
+
+        # Replace basic placeholders
         block = template.replace('{SUBDOMAIN}', tunnel['subdomain'])
         block = block.replace('{SERVER_PORT}', str(tunnel['server_port']))
+
+        # If HTTP auth enabled, generate htpasswd file and replace auth placeholders
+        if http_auth_enabled:
+            username = row_get(tunnel, 'http_auth_username', 'admin')
+            password_hash = row_get(tunnel, 'http_auth_hash', '')
+            realm = row_get(tunnel, 'http_auth_realm', 'Restricted Area')
+            htpasswd_file = htpasswd_base_dir / tunnel['subdomain']
+
+            # Generate htpasswd file
+            if username and password_hash:
+                try:
+                    create_htpasswd_file(str(htpasswd_file), username, password_hash)
+                except Exception as e:
+                    logger.error(f"Failed to create htpasswd file for {tunnel['subdomain']}: {e}")
+
+            # Replace auth placeholders
+            block = block.replace('{AUTH_REALM}', realm)
+            block = block.replace('{HTPASSWD_FILE}', str(htpasswd_file))
+
         config_blocks.append(block)
 
     # Return valid config even if no tunnels exist
@@ -903,6 +1056,165 @@ def check_dns_propagation(subdomain: str, expected_ip: str) -> bool:
         return False
 
 # ============================================================================
+# TUNNEL MONITORING (v2.0)
+# ============================================================================
+
+def check_port_listening(port: int, host: str = '127.0.0.1', timeout: float = 1.0) -> bool:
+    """Check if a port is listening on the specified host.
+
+    Args:
+        port: Port number to check
+        host: Host to check (default: localhost)
+        timeout: Connection timeout in seconds
+
+    Returns:
+        True if port is listening, False otherwise
+    """
+    import socket
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        result = sock.connect_ex((host, port))
+        sock.close()
+        return result == 0
+    except Exception:
+        return False
+
+def check_tunnel_active(tunnel: sqlite3.Row) -> dict:
+    """Check if a tunnel is actually active by probing its port.
+
+    Args:
+        tunnel: Tunnel row from database
+
+    Returns:
+        dict with keys:
+            - port_listening: bool
+            - checked_at: ISO timestamp
+    """
+    port_listening = check_port_listening(tunnel['server_port'])
+    checked_at = datetime.now(timezone.utc).isoformat()
+
+    return {
+        'port_listening': port_listening,
+        'checked_at': checked_at
+    }
+
+def update_tunnel_active_status(conn: sqlite3.Connection, tunnel_id: int, is_active: bool, checked_at: str):
+    """Update tunnel active status in database.
+
+    Args:
+        conn: Database connection
+        tunnel_id: Tunnel ID
+        is_active: True if tunnel is active
+        checked_at: ISO timestamp of check
+    """
+    cursor = conn.execute(
+        "SELECT consecutive_failures FROM tunnels WHERE id = ?",
+        (tunnel_id,)
+    )
+    row = cursor.fetchone()
+    current_failures = row['consecutive_failures'] if row else 0
+
+    if is_active:
+        # Reset failure counter
+        conn.execute("""
+            UPDATE tunnels
+            SET tunnel_active = 1,
+                last_active_check = ?,
+                consecutive_failures = 0
+            WHERE id = ?
+        """, (checked_at, tunnel_id))
+    else:
+        # Increment failure counter
+        conn.execute("""
+            UPDATE tunnels
+            SET tunnel_active = 0,
+                last_active_check = ?,
+                consecutive_failures = ?
+            WHERE id = ?
+        """, (checked_at, current_failures + 1, tunnel_id))
+
+    conn.commit()
+
+# ============================================================================
+# HTTP AUTH MANAGEMENT (v2.0)
+# ============================================================================
+
+def generate_htpasswd_hash(password: str) -> str:
+    """Generate bcrypt password hash for htpasswd file.
+
+    Uses htpasswd command-line tool (from apache2-utils) for compatibility.
+    Falls back to Python hashlib with SHA-512 if htpasswd is not available.
+
+    Args:
+        password: Plain text password
+
+    Returns:
+        Password hash in htpasswd format (bcrypt or SHA-512)
+    """
+    # Try htpasswd command (preferred - native bcrypt support)
+    try:
+        result = subprocess.run(
+            ['htpasswd', '-nbB', 'dummy', password],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            # Output format: "dummy:$2y$05$..."
+            # Extract hash after colon
+            parts = result.stdout.strip().split(':', 1)
+            if len(parts) == 2:
+                return parts[1]
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    # Fallback: Use Python hashlib with SHA-512 (APR1 format)
+    import secrets
+    salt = secrets.token_hex(8)
+    hash_obj = hashlib.sha512((password + salt).encode('utf-8'))
+    hash_b64 = base64.b64encode(hash_obj.digest()).decode('utf-8').rstrip('=')
+    return f"{{SHA512}}{salt}${hash_b64}"
+
+def create_htpasswd_file(filepath: str, username: str, password_hash: str):
+    """Create htpasswd file for nginx auth_basic.
+
+    Args:
+        filepath: Path to htpasswd file
+        username: Username
+        password_hash: Password hash from generate_htpasswd_hash()
+    """
+    htpasswd_dir = Path(filepath).parent
+    htpasswd_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write htpasswd file
+    with open(filepath, 'w') as f:
+        f.write(f"{username}:{password_hash}\n")
+
+    # Set permissions: readable by nginx (www-data)
+    try:
+        import pwd
+        import grp
+        # Make readable by tunneluser and www-data (nginx)
+        tunneluser_uid = pwd.getpwnam('tunneluser').pw_uid
+        gtwy_admin_gid = grp.getgrnam('gtwy-admin').gr_gid
+        os.chown(filepath, tunneluser_uid, gtwy_admin_gid)
+        os.chmod(filepath, 0o644)  # rw-r--r--
+    except (KeyError, PermissionError):
+        pass
+
+def delete_htpasswd_file(filepath: str):
+    """Delete htpasswd file.
+
+    Args:
+        filepath: Path to htpasswd file
+    """
+    try:
+        Path(filepath).unlink(missing_ok=True)
+    except Exception as e:
+        logger.warning(f"Failed to delete htpasswd file {filepath}: {e}")
+
+# ============================================================================
 # SSH AUTHORIZED_KEYS MANAGEMENT
 # ============================================================================
 
@@ -987,7 +1299,11 @@ def format_last_seen(last_seen_str: Optional[str]) -> str:
 
     try:
         last_seen = datetime.fromisoformat(last_seen_str)
-        delta = datetime.now() - last_seen
+        # Use timezone-aware datetime for correct delta calculation
+        if last_seen.tzinfo is None:
+            # If stored datetime is naive, assume UTC
+            last_seen = last_seen.replace(tzinfo=timezone.utc)
+        delta = datetime.now(timezone.utc) - last_seen
 
         if delta.seconds < 60:
             return "just now"
@@ -1093,16 +1409,72 @@ def run_config_migrations(config, config_path, from_version, to_version):
 
     return migrations_run
 
+def migrate_db_1_2_6_to_2_0_0(conn):
+    """Database migration for v2.0.0 - HTTP Auth & Tunnel Monitoring.
+
+    Adds columns to tunnels table for:
+    - HTTP Basic Auth functionality (optional per-tunnel authentication)
+    - Tunnel status monitoring (port listening checks)
+    """
+    # Add HTTP Auth columns
+    try:
+        conn.execute("ALTER TABLE tunnels ADD COLUMN http_auth_enabled INTEGER DEFAULT 0")
+        logger.info("Added column: http_auth_enabled")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+
+    try:
+        conn.execute("ALTER TABLE tunnels ADD COLUMN http_auth_username TEXT")
+        logger.info("Added column: http_auth_username")
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        conn.execute("ALTER TABLE tunnels ADD COLUMN http_auth_hash TEXT")
+        logger.info("Added column: http_auth_hash")
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        conn.execute("ALTER TABLE tunnels ADD COLUMN http_auth_realm TEXT DEFAULT 'Restricted Area'")
+        logger.info("Added column: http_auth_realm")
+    except sqlite3.OperationalError:
+        pass
+
+    # Add Tunnel Monitoring columns
+    try:
+        conn.execute("ALTER TABLE tunnels ADD COLUMN tunnel_active INTEGER")
+        logger.info("Added column: tunnel_active")
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        conn.execute("ALTER TABLE tunnels ADD COLUMN last_active_check TEXT")
+        logger.info("Added column: last_active_check")
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        conn.execute("ALTER TABLE tunnels ADD COLUMN consecutive_failures INTEGER DEFAULT 0")
+        logger.info("Added column: consecutive_failures")
+    except sqlite3.OperationalError:
+        pass
+
+    conn.commit()
+    logger.info("Database migration 1.2.6 → 2.0.0 completed")
+
 def run_database_migrations(conn, from_version, to_version):
     """Run database migrations from one version to another.
 
     Note: Only supports migrations from last stable (1.2.1) to current.
     """
-    # Database migrations (none needed for 1.2.1→1.2.2, 1.2.2→1.2.3, 1.2.3→1.2.4)
-    migrations = {}
+    # Database migrations
+    migrations = {
+        "1.2.6_to_2.0.0": migrate_db_1_2_6_to_2_0_0,
+    }
 
     # Supported version sequence (only last stable → current)
-    version_sequence = ["1.2.1", "1.2.2", "1.2.3", "1.2.4"]
+    version_sequence = ["1.2.1", "1.2.2", "1.2.3", "1.2.4", "1.2.5", "1.2.6", "2.0.0"]
 
     try:
         from_idx = version_sequence.index(from_version)
@@ -1205,8 +1577,14 @@ def cmd_install(args):
     # Create nginx-configs directory with gtwy-admin group write access
     nginx_configs_dir = gtwy_dir / 'nginx-configs'
     nginx_configs_dir.mkdir(exist_ok=True)
+
+    # Create htpasswd directory for HTTP auth (v2.0+)
+    htpasswd_dir = gtwy_dir / 'htpasswd'
+    htpasswd_dir.mkdir(exist_ok=True)
+
     print("   ✓ /opt/gtwy created")
     print("   ✓ /opt/gtwy/nginx-configs created")
+    print("   ✓ /opt/gtwy/htpasswd created")
 
     # 2. Copy script itself to /opt/gtwy/gtwy
     print("\n2. Installing gtwy script...")
@@ -1275,6 +1653,11 @@ def cmd_install(args):
     os.chown(nginx_configs_dir, 0, gtwy_admin_gid)
     os.chmod(nginx_configs_dir, 0o775)
 
+    # Set ownership of htpasswd directory: root:gtwy-admin (v2.0+)
+    htpasswd_dir = gtwy_dir / 'htpasswd'
+    os.chown(htpasswd_dir, 0, gtwy_admin_gid)
+    os.chmod(htpasswd_dir, 0o775)
+
     # Create initial nginx config (empty placeholder)
     nginx_config_file = nginx_configs_dir / 'tunnels-autogen.conf'
     with open(nginx_config_file, 'w') as f:
@@ -1293,6 +1676,7 @@ def cmd_install(args):
 
     nginx_symlink.symlink_to(nginx_target)
     print("   ✓ nginx configs directory: root:gtwy-admin 775")
+    print("   ✓ htpasswd directory: root:gtwy-admin 775")
     print("   ✓ Initial nginx config created")
     print(f"   ✓ Symlink: {nginx_symlink} → {nginx_target}")
 
@@ -1639,7 +2023,25 @@ def cmd_update(args):
         print(f"   ⚠ Warning: Could not setup log file: {e}")
         print("   Logging may not work correctly for SSH commands")
 
-    # 10. Success
+    # 10. Setup htpasswd directory (v2.0+)
+    if current_version >= "2.0.0":
+        print("\n10. Setting up htpasswd directory...")
+        htpasswd_dir = Path('/opt/gtwy/htpasswd')
+        try:
+            import grp
+            # Create directory if it doesn't exist
+            htpasswd_dir.mkdir(parents=True, exist_ok=True)
+            # Set ownership: root:gtwy-admin
+            gtwy_admin_gid = grp.getgrnam('gtwy-admin').gr_gid
+            os.chown(htpasswd_dir, 0, gtwy_admin_gid)
+            # Set permissions: 775 (rwxrwxr-x)
+            os.chmod(htpasswd_dir, 0o775)
+            print("   ✓ htpasswd directory created: /opt/gtwy/htpasswd (root:gtwy-admin 775)")
+        except Exception as e:
+            print(f"   ⚠ Warning: Could not setup htpasswd directory: {e}")
+            print("   HTTP auth may not work correctly")
+
+    # 11. Success
     print("\n" + "="*60)
     print(f"✓ gtwy updated successfully: {installed_version} → {current_version}")
     print("="*60)
@@ -2408,7 +2810,11 @@ def cmd_list(args):
                 'status': t['status'],
                 'created': t['created'],
                 'last_checked': t['last_checked'],
-                'error_message': t['error_message']
+                'error_message': t['error_message'],
+                'tunnel_active': row_get(t, 'tunnel_active'),
+                'last_active_check': row_get(t, 'last_active_check'),
+                'http_auth_enabled': bool(row_get(t, 'http_auth_enabled', 0)),
+                'http_auth_username': row_get(t, 'http_auth_username')
             })
 
         status_counts = {}
@@ -2422,21 +2828,54 @@ def cmd_list(args):
         }, indent=2))
     else:
         print("Active Tunnels:")
-        print(f"{'Subdomain':<35} {'Box':<10} {'Service':<10} {'Local':<6} {'Server':<6} {'Status':<12} {'Age':<8}")
-        print("-" * 95)
+        print(f"{'Subdomain':<35} {'Box':<10} {'Service':<10} {'Local':<6} {'Server':<6} {'Status':<12} {'Active':<7} {'Auth':<5} {'Age':<8}")
+        print("-" * 110)
 
         for t in tunnels:
             age = format_age(t['created'])
+
+            # Tunnel active status
+            tunnel_active = row_get(t, 'tunnel_active')
+            if tunnel_active is None:
+                active_str = "?"
+            elif tunnel_active:
+                active_str = "✓"
+            else:
+                active_str = "✗"
+
+            # HTTP auth status
+            auth_enabled = bool(row_get(t, 'http_auth_enabled', 0))
+            auth_str = "✓" if auth_enabled else "-"
+
             print(f"{t['subdomain']:<35} {t['box_id']:<10} {t['service']:<10} "
-                  f"{t['local_port']:<6} {t['server_port']:<6} {t['status']:<12} {age:<8}")
+                  f"{t['local_port']:<6} {t['server_port']:<6} {t['status']:<12} {active_str:<7} {auth_str:<5} {age:<8}")
 
         # Summary
         status_counts = {}
+        active_count = 0
+        inactive_count = 0
+        unchecked_count = 0
+        auth_count = 0
+
         for t in tunnels:
             status_counts[t['status']] = status_counts.get(t['status'], 0) + 1
 
+            tunnel_active = row_get(t, 'tunnel_active')
+            if tunnel_active is None:
+                unchecked_count += 1
+            elif tunnel_active:
+                active_count += 1
+            else:
+                inactive_count += 1
+
+            if row_get(t, 'http_auth_enabled', 0):
+                auth_count += 1
+
         summary = ', '.join([f"{count} {status}" for status, count in status_counts.items()])
         print(f"\nTotal: {len(tunnels)} tunnel(s) ({summary})")
+        print(f"Port Status: {active_count} active, {inactive_count} inactive, {unchecked_count} unchecked")
+        if auth_count > 0:
+            print(f"HTTP Auth: {auth_count} tunnel(s) with auth enabled")
 
     conn.close()
 
@@ -2468,6 +2907,27 @@ def cmd_info(args):
 
     if tunnel['error_message']:
         print(f"  Error:        {tunnel['error_message']}")
+
+    # HTTP Auth information
+    if row_get(tunnel, 'http_auth_enabled', 0):
+        print(f"\nHTTP Authentication:")
+        print(f"  Enabled:      ✓")
+        print(f"  Username:     {row_get(tunnel, 'http_auth_username', 'N/A')}")
+        print(f"  Realm:        {row_get(tunnel, 'http_auth_realm', 'Restricted Area')}")
+
+    # Tunnel active status
+    tunnel_active = row_get(tunnel, 'tunnel_active')
+    last_active_check = row_get(tunnel, 'last_active_check')
+    if tunnel_active is not None:
+        print(f"\nTunnel Port Status:")
+        status_text = "✓ Active (port listening)" if tunnel_active else "✗ Inactive (port not listening)"
+        print(f"  Status:       {status_text}")
+        if last_active_check:
+            check_age = format_age(last_active_check)
+            print(f"  Last Check:   {check_age} ago")
+        if not tunnel_active:
+            failures = row_get(tunnel, 'consecutive_failures', 0)
+            print(f"  Failures:     {failures} consecutive")
 
     print(f"\nComponent Status:")
 
@@ -2573,6 +3033,285 @@ def cmd_remove_tunnel(args):
     logger.info(f"Tunnel {subdomain} manually removed")
 
     conn.close()
+
+def cmd_enable_auth(args):
+    """Enable HTTP Basic Authentication for a tunnel."""
+    config = load_config(args.config)
+    conn = get_db_connection(args.db)
+
+    box_id = args.box
+    service = args.service
+    username = args.username
+    password = args.password
+    realm = args.realm if hasattr(args, 'realm') and args.realm else "Restricted Area"
+
+    # Validate inputs
+    validate_box_id(box_id)
+    validate_service_name(service)
+
+    if not username or not password:
+        raise ValidationError("Username and password are required")
+
+    if len(password) < 8:
+        raise ValidationError("Password must be at least 8 characters long")
+
+    # Find tunnel
+    cursor = conn.execute(
+        "SELECT * FROM tunnels WHERE box_id = ? AND service = ?",
+        (box_id, service)
+    )
+    tunnel = cursor.fetchone()
+
+    if not tunnel:
+        raise NotFoundError(f"Tunnel for service '{service}' on box '{box_id}' not found")
+
+    # Generate password hash
+    try:
+        password_hash = generate_htpasswd_hash(password)
+    except Exception as e:
+        raise GatewayError(f"Failed to generate password hash: {e}")
+
+    # Update tunnel with auth credentials
+    conn.execute("""
+        UPDATE tunnels
+        SET http_auth_enabled = 1,
+            http_auth_username = ?,
+            http_auth_hash = ?,
+            http_auth_realm = ?
+        WHERE box_id = ? AND service = ?
+    """, (username, password_hash, realm, box_id, service))
+    conn.commit()
+
+    # Regenerate nginx config and reload
+    try:
+        nginx_config = generate_nginx_config(conn, config.get('nginx', {}).get('template_path'))
+        write_nginx_config(nginx_config, config['nginx']['config_path'])
+
+        if not test_nginx_config():
+            raise GatewayError("nginx configuration test failed")
+
+        reload_nginx()
+    except Exception as e:
+        # Rollback auth settings
+        conn.execute("""
+            UPDATE tunnels
+            SET http_auth_enabled = 0,
+                http_auth_username = NULL,
+                http_auth_hash = NULL,
+                http_auth_realm = NULL
+            WHERE box_id = ? AND service = ?
+        """, (box_id, service))
+        conn.commit()
+        conn.close()
+        raise GatewayError(f"Failed to update nginx configuration: {e}")
+
+    conn.close()
+
+    print(f"✓ HTTP Auth enabled for {service}.{box_id}")
+    print(f"  Username: {username}")
+    print(f"  Realm: {realm}")
+    logger.info(f"HTTP Auth enabled for tunnel {service}.{box_id} (user: {username})")
+
+def cmd_disable_auth(args):
+    """Disable HTTP Basic Authentication for a tunnel."""
+    config = load_config(args.config)
+    conn = get_db_connection(args.db)
+
+    box_id = args.box
+    service = args.service
+
+    # Validate inputs
+    validate_box_id(box_id)
+    validate_service_name(service)
+
+    # Find tunnel
+    cursor = conn.execute(
+        "SELECT * FROM tunnels WHERE box_id = ? AND service = ?",
+        (box_id, service)
+    )
+    tunnel = cursor.fetchone()
+
+    if not tunnel:
+        raise NotFoundError(f"Tunnel for service '{service}' on box '{box_id}' not found")
+
+    if not row_get(tunnel, 'http_auth_enabled', 0):
+        print(f"HTTP Auth is not enabled for {service}.{box_id}")
+        conn.close()
+        return
+
+    # Remove auth credentials from database
+    conn.execute("""
+        UPDATE tunnels
+        SET http_auth_enabled = 0,
+            http_auth_username = NULL,
+            http_auth_hash = NULL,
+            http_auth_realm = NULL
+        WHERE box_id = ? AND service = ?
+    """, (box_id, service))
+    conn.commit()
+
+    # Delete htpasswd file
+    subdomain = tunnel['subdomain']
+    htpasswd_file = Path("/opt/gtwy/htpasswd") / subdomain
+    delete_htpasswd_file(str(htpasswd_file))
+
+    # Regenerate nginx config and reload
+    try:
+        nginx_config = generate_nginx_config(conn, config.get('nginx', {}).get('template_path'))
+        write_nginx_config(nginx_config, config['nginx']['config_path'])
+
+        if not test_nginx_config():
+            raise GatewayError("nginx configuration test failed")
+
+        reload_nginx()
+    except Exception as e:
+        conn.close()
+        raise GatewayError(f"Failed to update nginx configuration: {e}")
+
+    conn.close()
+
+    print(f"✓ HTTP Auth disabled for {service}.{box_id}")
+    logger.info(f"HTTP Auth disabled for tunnel {service}.{box_id}")
+
+def cmd_update_auth(args):
+    """Update HTTP Basic Authentication credentials for a tunnel."""
+    config = load_config(args.config)
+    conn = get_db_connection(args.db)
+
+    box_id = args.box
+    service = args.service
+    username = args.username
+    password = args.password
+    realm = args.realm if hasattr(args, 'realm') and args.realm else None
+
+    # Validate inputs
+    validate_box_id(box_id)
+    validate_service_name(service)
+
+    if not username and not password and not realm:
+        raise ValidationError("At least one of username, password, or realm must be provided")
+
+    if password and len(password) < 8:
+        raise ValidationError("Password must be at least 8 characters long")
+
+    # Find tunnel
+    cursor = conn.execute(
+        "SELECT * FROM tunnels WHERE box_id = ? AND service = ?",
+        (box_id, service)
+    )
+    tunnel = cursor.fetchone()
+
+    if not tunnel:
+        raise NotFoundError(f"Tunnel for service '{service}' on box '{box_id}' not found")
+
+    if not row_get(tunnel, 'http_auth_enabled', 0):
+        raise ValidationError(f"HTTP Auth is not enabled for {service}.{box_id}. Use 'enable-auth' first.")
+
+    # Prepare update query
+    updates = []
+    params = []
+
+    if username:
+        updates.append("http_auth_username = ?")
+        params.append(username)
+
+    if password:
+        try:
+            password_hash = generate_htpasswd_hash(password)
+            updates.append("http_auth_hash = ?")
+            params.append(password_hash)
+        except Exception as e:
+            conn.close()
+            raise GatewayError(f"Failed to generate password hash: {e}")
+
+    if realm:
+        updates.append("http_auth_realm = ?")
+        params.append(realm)
+
+    params.extend([box_id, service])
+
+    # Update tunnel
+    conn.execute(f"""
+        UPDATE tunnels
+        SET {', '.join(updates)}
+        WHERE box_id = ? AND service = ?
+    """, params)
+    conn.commit()
+
+    # Regenerate nginx config and reload
+    try:
+        nginx_config = generate_nginx_config(conn, config.get('nginx', {}).get('template_path'))
+        write_nginx_config(nginx_config, config['nginx']['config_path'])
+
+        if not test_nginx_config():
+            raise GatewayError("nginx configuration test failed")
+
+        reload_nginx()
+    except Exception as e:
+        conn.close()
+        raise GatewayError(f"Failed to update nginx configuration: {e}")
+
+    conn.close()
+
+    print(f"✓ HTTP Auth credentials updated for {service}.{box_id}")
+    if username:
+        print(f"  Username: {username}")
+    if password:
+        print(f"  Password: updated")
+    if realm:
+        print(f"  Realm: {realm}")
+    logger.info(f"HTTP Auth credentials updated for tunnel {service}.{box_id}")
+
+def cmd_check_tunnels(args):
+    """Check which tunnels are actually active by probing their ports."""
+    conn = get_db_connection(args.db)
+
+    # Get all non-error tunnels
+    cursor = conn.execute("SELECT * FROM tunnels WHERE status != 'error' ORDER BY subdomain")
+    tunnels = cursor.fetchall()
+
+    if not tunnels:
+        print("No tunnels to check.")
+        conn.close()
+        return
+
+    print(f"Checking {len(tunnels)} tunnel(s)...\n")
+
+    active_count = 0
+    inactive_count = 0
+
+    for tunnel in tunnels:
+        # Check if port is listening
+        result = check_tunnel_active(tunnel)
+        is_active = result['port_listening']
+
+        # Update database
+        update_tunnel_active_status(conn, tunnel['id'], is_active, result['checked_at'])
+
+        # Print result
+        status_symbol = "✓" if is_active else "✗"
+        status_text = "ACTIVE" if is_active else "INACTIVE"
+        port_info = f"port {tunnel['server_port']}"
+
+        print(f"{status_symbol} {tunnel['subdomain']:<50} ({port_info}) - {status_text}")
+
+        if is_active:
+            active_count += 1
+        else:
+            inactive_count += 1
+
+    conn.close()
+
+    # Summary
+    total = len(tunnels)
+    percentage = int((active_count / total) * 100) if total > 0 else 0
+
+    print(f"\nSummary: {active_count}/{total} tunnels active ({percentage}%)")
+
+    if inactive_count > 0:
+        print(f"⚠ {inactive_count} tunnel(s) inactive (port not listening)")
+
+    logger.info(f"Tunnel check completed: {active_count}/{total} active")
 
 # ============================================================================
 # COMMANDS - STATUS & DIAGNOSTICS
@@ -3381,6 +4120,38 @@ def build_parser():
     p_remove.add_argument('-y', '--yes', action='store_true',
                           help='Skip confirmation')
     p_remove.set_defaults(func=cmd_remove_tunnel)
+
+    # enable-auth (v2.0)
+    p_enable_auth = subparsers.add_parser('enable-auth',
+                                           help='Enable HTTP auth for tunnel')
+    p_enable_auth.add_argument('box', help='Box ID')
+    p_enable_auth.add_argument('service', help='Service name')
+    p_enable_auth.add_argument('username', help='Auth username')
+    p_enable_auth.add_argument('password', help='Auth password')
+    p_enable_auth.add_argument('--realm', help='Auth realm (default: Restricted Area)')
+    p_enable_auth.set_defaults(func=cmd_enable_auth)
+
+    # disable-auth (v2.0)
+    p_disable_auth = subparsers.add_parser('disable-auth',
+                                            help='Disable HTTP auth for tunnel')
+    p_disable_auth.add_argument('box', help='Box ID')
+    p_disable_auth.add_argument('service', help='Service name')
+    p_disable_auth.set_defaults(func=cmd_disable_auth)
+
+    # update-auth (v2.0)
+    p_update_auth = subparsers.add_parser('update-auth',
+                                           help='Update HTTP auth credentials')
+    p_update_auth.add_argument('box', help='Box ID')
+    p_update_auth.add_argument('service', help='Service name')
+    p_update_auth.add_argument('--username', help='New username')
+    p_update_auth.add_argument('--password', help='New password')
+    p_update_auth.add_argument('--realm', help='New realm')
+    p_update_auth.set_defaults(func=cmd_update_auth)
+
+    # check-tunnels (v2.0)
+    p_check_tunnels = subparsers.add_parser('check-tunnels',
+                                             help='Check tunnel port status')
+    p_check_tunnels.set_defaults(func=cmd_check_tunnels)
 
     # status
     p_status = subparsers.add_parser('status',

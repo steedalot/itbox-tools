@@ -1,0 +1,1125 @@
+#!/usr/bin/env python3
+"""
+boxctl - IT.Box Container Management Tool
+Version 0.1
+
+Manages Docker containers for IT.Box infrastructure with automatic
+docker-compose.yml generation, secrets management, and easy deployment.
+
+Usage:
+    sudo boxctl install                 # Initial setup
+    sudo boxctl sync                    # Sync container catalog
+    boxctl list                         # List available containers
+    sudo boxctl add <container>         # Add container
+    sudo boxctl remove <container>      # Remove container
+    boxctl status                       # Show status
+    boxctl ports [container]            # Show port info
+
+Author: IT.Box Project
+License: MIT
+"""
+
+import sys
+import os
+import subprocess
+import json
+import secrets
+import string
+import shutil
+from pathlib import Path
+from datetime import datetime
+from urllib.request import urlopen
+from urllib.error import URLError
+
+try:
+    import yaml
+except ImportError:
+    print("Error: PyYAML not installed. Run: sudo apt install python3-yaml")
+    sys.exit(1)
+
+try:
+    import requests
+except ImportError:
+    print("Error: requests not installed. Run: sudo apt install python3-requests")
+    sys.exit(1)
+
+
+# ============================================================================
+# CONSTANTS
+# ============================================================================
+
+VERSION = "2.0.0"
+
+# Default paths
+DEFAULT_BASE_DIR = Path("/opt/itbox")
+DEFAULT_CONFIG_DIR = DEFAULT_BASE_DIR / "config" / "boxctl"
+DEFAULT_COMPOSE_DIR = DEFAULT_BASE_DIR / "compose"
+DEFAULT_DATA_DIR = DEFAULT_BASE_DIR / "data"
+
+# Container catalog URL
+DEFAULT_CATALOG_URL = "https://apps.kibox.online/containers"
+
+# Files
+STATE_FILE = "state.yaml"
+CATALOG_FILE = "catalog.yaml"
+COMPOSE_FILE = "docker-compose.yml"
+ENV_FILE = ".env"
+
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
+def generate_password(length=20):
+    """Generate secure password"""
+    chars = string.ascii_letters + string.digits + "!@#$%^&*-_"
+    return ''.join(secrets.choice(chars) for _ in range(length))
+
+
+def generate_secret(length=32):
+    """Generate secret key (hex)"""
+    return secrets.token_hex(length)
+
+
+def generate_api_key(prefix="itbox", length=32):
+    """Generate API key with prefix"""
+    return f"{prefix}_{secrets.token_urlsafe(length)}"
+
+
+def ensure_root():
+    """Ensure script is run as root"""
+    if os.geteuid() != 0:
+        print("Error: This command must be run as root (use sudo)")
+        sys.exit(1)
+
+
+def run_command(cmd, check=True, capture_output=False):
+    """Run shell command"""
+    try:
+        result = subprocess.run(
+            cmd,
+            shell=isinstance(cmd, str),
+            check=check,
+            capture_output=capture_output,
+            text=True
+        )
+        return result
+    except subprocess.CalledProcessError as e:
+        print(f"Error running command: {e}")
+        if capture_output:
+            print(f"Output: {e.output}")
+        sys.exit(1)
+
+
+def load_yaml(file_path):
+    """Load YAML file"""
+    try:
+        with open(file_path, 'r') as f:
+            return yaml.safe_load(f)
+    except FileNotFoundError:
+        return None
+    except yaml.YAMLError as e:
+        print(f"Error parsing YAML file {file_path}: {e}")
+        sys.exit(1)
+
+
+def save_yaml(data, file_path):
+    """Save YAML file"""
+    try:
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(file_path, 'w') as f:
+            yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+    except Exception as e:
+        print(f"Error saving YAML file {file_path}: {e}")
+        sys.exit(1)
+
+
+def print_header(text):
+    """Print formatted header"""
+    print(f"\n{'=' * 60}")
+    print(f"  {text}")
+    print(f"{'=' * 60}\n")
+
+
+def print_success(text):
+    """Print success message"""
+    print(f"✅ {text}")
+
+
+def print_error(text):
+    """Print error message"""
+    print(f"❌ {text}")
+
+
+def print_info(text):
+    """Print info message"""
+    print(f"💡 {text}")
+
+
+def print_step(text):
+    """Print step message"""
+    print(f"▸ {text}...", end='', flush=True)
+
+
+def print_done():
+    """Print done marker"""
+    print(" ✓")
+
+
+# ============================================================================
+# CONTAINER MANAGER
+# ============================================================================
+
+class ContainerManager:
+    """Manages Docker containers for IT.Box"""
+
+    def __init__(self, config_dir=None, compose_dir=None, data_dir=None, catalog_url=None):
+        self.config_dir = Path(config_dir or DEFAULT_CONFIG_DIR)
+        self.compose_dir = Path(compose_dir or DEFAULT_COMPOSE_DIR)
+        self.data_dir = Path(data_dir or DEFAULT_DATA_DIR)
+        self.catalog_url = catalog_url or DEFAULT_CATALOG_URL
+
+        self.state_file = self.config_dir / STATE_FILE
+        self.catalog_file = self.config_dir / CATALOG_FILE
+        self.containers_dir = self.config_dir / "containers"
+
+        self.compose_file = self.compose_dir / COMPOSE_FILE
+        self.env_file = self.compose_dir / ENV_FILE
+
+    def load_state(self):
+        """Load state.yaml"""
+        state = load_yaml(self.state_file)
+        if not state:
+            # Initialize empty state
+            state = {
+                'version': '1.0',
+                'updated': datetime.now().isoformat(),
+                'catalog': {},
+                'box': {},
+                'containers': {},
+                'ports': {'allocated': {}}
+            }
+        return state
+
+    def save_state(self, state):
+        """Save state.yaml"""
+        state['updated'] = datetime.now().isoformat()
+        save_yaml(state, self.state_file)
+
+    def load_catalog(self):
+        """Load catalog.yaml"""
+        catalog = load_yaml(self.catalog_file)
+        if not catalog:
+            print_error("Catalog not found. Run 'boxctl sync' first.")
+            sys.exit(1)
+        return catalog
+
+    def load_container_def(self, container_id):
+        """Load container definition"""
+        def_file = self.containers_dir / f"{container_id}.yaml"
+        container_def = load_yaml(def_file)
+        if not container_def:
+            print_error(f"Container definition not found: {container_id}")
+            sys.exit(1)
+        return container_def
+
+    def check_port_available(self, port, state):
+        """Check if port is available"""
+        allocated = state['ports']['allocated']
+        if str(port) in allocated:
+            return False, allocated[str(port)]
+        return True, None
+
+    def load_compose(self):
+        """Load docker-compose.yml"""
+        if self.compose_file.exists():
+            return load_yaml(self.compose_file)
+        return {
+            'services': {},
+            'networks': {
+                'itbox-network': {
+                    'driver': 'bridge'
+                }
+            }
+        }
+
+    def save_compose(self, compose_data):
+        """Save docker-compose.yml"""
+        save_yaml(compose_data, self.compose_file)
+
+    def load_env(self):
+        """Load .env file as dict"""
+        env_vars = {}
+        if self.env_file.exists():
+            with open(self.env_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        if '=' in line:
+                            key, value = line.split('=', 1)
+                            env_vars[key.strip()] = value.strip()
+        return env_vars
+
+    def save_env(self, env_vars):
+        """Save .env file"""
+        self.env_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.env_file, 'w') as f:
+            f.write("# IT.Box Environment Variables\n")
+            f.write(f"# Generated by boxctl {VERSION}\n")
+            f.write(f"# Last updated: {datetime.now().isoformat()}\n\n")
+
+            # Global IT.Box variables
+            f.write("# === GLOBAL IT.BOX VARIABLES ===\n")
+            global_vars = ['ITBOX_LLM_ENDPOINT', 'ITBOX_LLM_API_KEY']
+            for key in global_vars:
+                if key in env_vars:
+                    f.write(f"{key}={env_vars[key]}\n")
+
+            f.write("\n# === CONTAINER SECRETS ===\n")
+            for key, value in sorted(env_vars.items()):
+                if key not in global_vars:
+                    f.write(f"{key}={value}\n")
+
+    def ensure_global_env(self, global_env_list):
+        """
+        Ensure global environment variables are set.
+        Checks if required global vars exist in .env, prompts user if missing.
+
+        Args:
+            global_env_list: List of global_env items from container YAML
+
+        Returns:
+            True if all required vars are present, False otherwise
+        """
+        if not global_env_list:
+            return True
+
+        env_vars = self.load_env()
+        missing_required = []
+
+        for item in global_env_list:
+            key = item['key']
+            required = item.get('required', False)
+            default = item.get('default', '')
+            description = item.get('description', '')
+
+            if key not in env_vars or not env_vars[key]:
+                if required:
+                    # Prompt user for required global var
+                    print(f"\n🔑 Globale Variable benötigt: {key}")
+                    print(f"   {description}")
+
+                    if default:
+                        user_input = input(f"   Wert [{default}]: ").strip()
+                        value = user_input if user_input else default
+                    else:
+                        value = input(f"   Wert: ").strip()
+
+                    if not value:
+                        missing_required.append(key)
+                        print_error(f"   {key} ist erforderlich!")
+                    else:
+                        env_vars[key] = value
+                        self.save_env(env_vars)
+                        print(f"   ✅ {key} gesetzt")
+                else:
+                    # Optional - use default if available
+                    if default:
+                        env_vars[key] = default
+                        self.save_env(env_vars)
+
+        return len(missing_required) == 0
+
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+def setup_permissions(manager):
+    """Setup secure permissions for /opt/itbox directories"""
+    import grp
+
+    try:
+        # Get docker group GID
+        docker_gid = grp.getgrnam('docker').gr_gid
+    except KeyError:
+        print_error("Docker group not found. Install docker first: sudo apt install docker.io")
+        return False
+
+    base_dir = manager.compose_dir.parent  # /opt/itbox
+
+    try:
+        # /opt/itbox/ → root:root (755)
+        os.chown(str(base_dir), 0, 0)
+        os.chmod(str(base_dir), 0o755)
+
+        # /opt/itbox/config/ → root:itbox (750)
+        config_dir = base_dir / "config"
+        if config_dir.exists():
+            os.chown(str(config_dir), 0, 1000)  # itbox GID = 1000
+            os.chmod(str(config_dir), 0o750)
+
+        # /opt/itbox/compose/ → root:docker (750)
+        compose_dir = manager.compose_dir
+        if compose_dir.exists():
+            os.chown(str(compose_dir), 0, docker_gid)
+            os.chmod(str(compose_dir), 0o750)
+
+        # /opt/itbox/compose/.env → root:docker (640) - CRITICAL!
+        env_file = manager.env_file
+        if env_file.exists():
+            os.chown(str(env_file), 0, docker_gid)
+            os.chmod(str(env_file), 0o640)
+
+        # /opt/itbox/compose/docker-compose.yml → root:docker (644)
+        compose_file = manager.compose_file
+        if compose_file.exists():
+            os.chown(str(compose_file), 0, docker_gid)
+            os.chmod(str(compose_file), 0o644)
+
+        # /opt/itbox/data/ → itbox:itbox (755)
+        data_dir = manager.data_dir
+        if data_dir.exists():
+            os.chown(str(data_dir), 1000, 1000)
+            os.chmod(str(data_dir), 0o755)
+
+        return True
+
+    except Exception as e:
+        print_error(f"Failed to set permissions: {e}")
+        return False
+
+
+# ============================================================================
+# COMMANDS
+# ============================================================================
+
+def cmd_install(args):
+    """Install boxctl and create directory structure"""
+    ensure_root()
+
+    print_header("boxctl Installation")
+
+    manager = ContainerManager()
+
+    # Create directories
+    print_step("Creating directories")
+    manager.config_dir.mkdir(parents=True, exist_ok=True)
+    manager.compose_dir.mkdir(parents=True, exist_ok=True)
+    manager.data_dir.mkdir(parents=True, exist_ok=True)
+    manager.containers_dir.mkdir(parents=True, exist_ok=True)
+    print_done()
+
+    # Ask for catalog URL
+    print()
+    print("Container Catalog Configuration:")
+    catalog_url = input(f"Catalog URL [{DEFAULT_CATALOG_URL}]: ").strip()
+    if not catalog_url:
+        catalog_url = DEFAULT_CATALOG_URL
+    print(f"Using: {catalog_url}")
+
+    # LLM-Proxy Configuration
+    print()
+    print("🔑 IT.Box LLM-Proxy Konfiguration:")
+    print("   Der zentrale LLM-Proxy (LiteLLM) ermöglicht KI-Zugriff.")
+    print("   Endpoint: https://llm.kibox.online/v1")
+    print()
+
+    llm_key = input("   IT.Box LLM API Key (Enter für 'später'): ").strip()
+
+    # Initialize .env with global variables
+    env_vars = {}
+    env_vars['ITBOX_LLM_ENDPOINT'] = 'https://llm.kibox.online/v1'
+
+    if llm_key:
+        env_vars['ITBOX_LLM_API_KEY'] = llm_key
+        print("   ✅ LLM-Proxy konfiguriert!")
+        print("   Alle LLM-Container (open-webui, langflow) funktionieren sofort!")
+    else:
+        env_vars['ITBOX_LLM_API_KEY'] = ''
+        print("   → Später setzen mit: sudo boxctl secrets set ITBOX_LLM_API_KEY")
+
+    manager.save_env(env_vars)
+
+    # Set secure permissions
+    print()
+    print_step("Setting secure permissions")
+    if setup_permissions(manager):
+        print_done()
+    else:
+        print(" ⚠️  Permissions partially set (see errors above)")
+
+    # Initialize state
+    print()
+    print_step("Initializing state")
+    state = {
+        'version': '0.1',
+        'updated': datetime.now().isoformat(),
+        'catalog': {
+            'url': catalog_url,
+            'last_sync': None,
+        },
+        'box': {
+            'id': 'box01',
+            'installed_at': datetime.now().isoformat(),
+        },
+        'containers': {},
+        'ports': {'allocated': {}}
+    }
+    manager.save_state(state)
+    print_done()
+
+    print_success("boxctl installed successfully!")
+    print_info("Next steps:")
+    print("  1. Sync catalog: sudo boxctl sync")
+    print("  2. List containers: boxctl list")
+    print("  3. Add container: sudo boxctl add <name>")
+
+
+def cmd_sync(args):
+    """Sync container catalog from server"""
+    manager = ContainerManager()
+
+    if not manager.state_file.exists():
+        print_error("boxctl not installed. Run 'sudo boxctl install' first.")
+        sys.exit(1)
+
+    print_header("Syncing Container Catalog")
+
+    state = manager.load_state()
+    catalog_url = state['catalog'].get('url', manager.catalog_url)
+
+    # Download catalog.yaml
+    print_step(f"Downloading catalog from {catalog_url}")
+    try:
+        response = requests.get(f"{catalog_url}/catalog.yaml", timeout=10)
+        response.raise_for_status()
+        catalog_data = yaml.safe_load(response.text)
+
+        # Save catalog
+        save_yaml(catalog_data, manager.catalog_file)
+        print_done()
+    except Exception as e:
+        print(f" ✗")
+        print_error(f"Failed to download catalog: {e}")
+        sys.exit(1)
+
+    # Download container definitions
+    print(f"Downloading {len(catalog_data['containers'])} container definitions:")
+    for container in catalog_data['containers']:
+        container_id = container['id']
+        def_url = f"{catalog_url}/{container['url']}"
+
+        print_step(f"  {container_id}")
+        try:
+            response = requests.get(def_url, timeout=10)
+            response.raise_for_status()
+
+            def_file = manager.containers_dir / f"{container_id}.yaml"
+            def_file.write_text(response.text)
+            print_done()
+        except Exception as e:
+            print(f" ✗")
+            print_error(f"Failed to download {container_id}: {e}")
+
+    # Update state
+    state['catalog']['last_sync'] = datetime.now().isoformat()
+    manager.save_state(state)
+
+    print_success("Catalog synchronized successfully!")
+
+
+def cmd_list(args):
+    """List available containers"""
+    manager = ContainerManager()
+
+    if not manager.catalog_file.exists():
+        print_error("Catalog not found. Run 'sudo boxctl sync' first.")
+        sys.exit(1)
+
+    catalog = manager.load_catalog()
+    state = manager.load_state()
+    installed = state['containers']
+
+    print_header("Available Containers")
+
+    # Group by category
+    categories = {cat['id']: cat for cat in catalog['categories']}
+
+    for cat_id, cat_info in categories.items():
+        icon = cat_info.get('icon', '📦')
+        print(f"\n{icon} {cat_info['name']}:")
+
+        for container in catalog['containers']:
+            if container['category'] != cat_id:
+                continue
+
+            container_id = container['id']
+            name = container['name']
+            desc = container['description']
+
+            # Status
+            if container_id in installed:
+                status = "✓"
+            else:
+                status = " "
+
+            # Tags
+            tags = []
+            if container.get('required'):
+                tags.append("required")
+            if container.get('recommended'):
+                tags.append("recommended")
+            if container.get('warnings'):
+                tags.append("⚠️")
+
+            tag_str = f" ({', '.join(tags)})" if tags else ""
+
+            print(f"  [{status}] {name:<20} - {desc}{tag_str}")
+
+    print("\nLegend: [✓] installed, [ ] available")
+    print_info("Install: sudo boxctl add <name>")
+
+
+def cmd_add(args):
+    """Add a container"""
+    ensure_root()
+
+    if not args.container:
+        print_error("Usage: boxctl add <container>")
+        sys.exit(1)
+
+    container_id = args.container
+    manager = ContainerManager()
+
+    if not manager.catalog_file.exists():
+        print_error("Catalog not found. Run 'sudo boxctl sync' first.")
+        sys.exit(1)
+
+    # Load data
+    catalog = manager.load_catalog()
+    state = manager.load_state()
+    container_def = manager.load_container_def(container_id)
+
+    # Check if already installed
+    if container_id in state['containers']:
+        print_error(f"{container_id} is already installed")
+        sys.exit(1)
+
+    print_header(f"Installing {container_def['name']}")
+
+    print(f"Description: {container_def['description']}")
+    if container_def.get('links', {}).get('homepage'):
+        print(f"Homepage: {container_def['links']['homepage']}")
+    print()
+
+    # Check dependencies
+    depends_on = container_def.get('depends_on', [])
+    if depends_on:
+        print("Dependencies:")
+        for dep in depends_on:
+            if dep in state['containers']:
+                print(f"  ✓ {dep} (installed)")
+            else:
+                print_error(f"Dependency not met: {dep}")
+                print(f"Please install {dep} first: sudo boxctl add {dep}")
+                sys.exit(1)
+
+    # Check global environment variables
+    global_env = container_def.get('global_env', [])
+    if global_env:
+        print()
+        if not manager.ensure_global_env(global_env):
+            print_error("Required global environment variables missing")
+            sys.exit(1)
+
+    # Check ports
+    print("Checking ports:")
+    for port_info in container_def['ports']:
+        port = port_info['host']
+        protocol = port_info['protocol']
+        available, used_by = manager.check_port_available(port, state)
+
+        if available:
+            print(f"  ✓ {port}/{protocol} available")
+        else:
+            print_error(f"Port {port}/{protocol} already used by {used_by}")
+            sys.exit(1)
+
+    # Handle secrets
+    env_vars = manager.load_env()
+
+    secrets = container_def.get('secrets', [])
+    if secrets:
+        print(f"\nConfiguring secrets ({len(secrets)}):")
+
+        for i, secret in enumerate(secrets, 1):
+            key = secret['key']
+            desc = secret['description']
+            generate_type = secret.get('generate')
+
+            print(f"\n[{i}/{len(secrets)}] {key}")
+            print(f"  {desc}")
+
+            if generate_type:
+                response = input("  Auto-generate? [Y/n]: ").strip().lower()
+                if response in ['', 'y', 'yes']:
+                    if generate_type == 'password':
+                        value = generate_password()
+                    elif generate_type == 'secret':
+                        value = generate_secret()
+                    elif generate_type == 'api_key':
+                        value = generate_api_key()
+                    else:
+                        value = generate_password()
+
+                    print(f"  ✓ Generated: {value[:8]}...")
+                    env_vars[key] = value
+                else:
+                    value = input("  Enter value: ").strip()
+                    env_vars[key] = value
+            else:
+                value = input("  Enter value: ").strip()
+                if value:
+                    env_vars[key] = value
+                elif secret.get('required'):
+                    print_error("This secret is required!")
+                    sys.exit(1)
+
+    # Handle interactive prompts
+    prompts = container_def.get('prompts', [])
+    if prompts:
+        print(f"\n📝 Container-Konfiguration ({len(prompts)} Fragen):")
+
+        for i, prompt in enumerate(prompts, 1):
+            key = prompt['key']
+            question = prompt['question']
+            default = prompt.get('default', '')
+            options = prompt.get('options', [])
+            description = prompt.get('description', '')
+            validate = prompt.get('validate', '')
+
+            print(f"\n[{i}/{len(prompts)}] {question}")
+            if description:
+                print(f"  💡 {description}")
+
+            if options:
+                # Multiple choice
+                for opt_idx, opt in enumerate(options, 1):
+                    marker = "→" if (default and opt == default) else " "
+                    print(f"  {marker} {opt_idx}. {opt}")
+
+                if default:
+                    default_idx = options.index(default) + 1 if default in options else 1
+                    choice_input = input(f"  Wahl [{'default'} = {default_idx}]: ").strip()
+                else:
+                    choice_input = input(f"  Wahl [1]: ").strip()
+
+                if not choice_input:
+                    value = default if default else options[0]
+                else:
+                    try:
+                        choice_idx = int(choice_input) - 1
+                        if 0 <= choice_idx < len(options):
+                            value = options[choice_idx]
+                        else:
+                            print(f"  ⚠️  Ungültige Wahl, verwende Default: {default}")
+                            value = default if default else options[0]
+                    except ValueError:
+                        print(f"  ⚠️  Ungültige Eingabe, verwende Default: {default}")
+                        value = default if default else options[0]
+            else:
+                # Free text input
+                if default:
+                    value = input(f"  Wert [default = {default}]: ").strip()
+                    value = value if value else default
+                else:
+                    value = input(f"  Wert: ").strip()
+
+            # Validation
+            if validate and value:
+                valid = True
+                if validate == 'int':
+                    try:
+                        int(value)
+                    except ValueError:
+                        print(f"  ⚠️  Muss eine Ganzzahl sein, verwende Default: {default}")
+                        value = default
+                        valid = False
+                elif validate == 'float':
+                    try:
+                        float(value)
+                    except ValueError:
+                        print(f"  ⚠️  Muss eine Dezimalzahl sein, verwende Default: {default}")
+                        value = default
+                        valid = False
+                elif validate == 'url':
+                    if not value.startswith(('http://', 'https://')):
+                        print(f"  ⚠️  Muss eine URL sein, verwende Default: {default}")
+                        value = default
+                        valid = False
+
+                if valid:
+                    print(f"  ✅ {key} = {value}")
+            else:
+                print(f"  ✅ {key} = {value}")
+
+            env_vars[key] = value
+
+    # Confirmation
+    print("\nSummary:")
+    print(f"  Container: {container_def['name']}")
+    ports_str = ', '.join([f"{p['host']}/{p['protocol']}" for p in container_def['ports']])
+    print(f"  Ports: {ports_str}")
+    if secrets:
+        print(f"  Secrets: {len(secrets)} configured")
+    if prompts:
+        print(f"  Konfiguration: {len(prompts)} Parameter gesetzt")
+
+    response = input("\nInstall container? [Y/n]: ").strip().lower()
+    if response not in ['', 'y', 'yes']:
+        print("Installation cancelled.")
+        sys.exit(0)
+
+    # Create directories
+    print()
+    for volume in container_def['volumes']:
+        host_path = Path(volume['host'])
+        if not host_path.exists() and '/opt/itbox/' in str(host_path):
+            print_step(f"Creating {host_path}")
+            host_path.mkdir(parents=True, exist_ok=True)
+            run_command(f"chown -R 1000:1000 {host_path}", check=False)
+            print_done()
+
+    # Create config files
+    configs = container_def.get('configs', [])
+    for config in configs:
+        config_path = Path(config['path'])
+        if not config_path.exists():
+            print_step(f"Creating {config_path}")
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            config_path.write_text(config['content'])
+            run_command(f"chown 1000:1000 {config_path}", check=False)
+            print_done()
+
+    # Update docker-compose.yml
+    print_step("Updating docker-compose.yml")
+    compose_data = manager.load_compose()
+
+    # Build service definition
+    service = {
+        'image': f"{container_def['image']['name']}:{container_def['image']['tag']}",
+        'container_name': container_id,
+        'restart': 'unless-stopped',
+        'ports': [],
+        'volumes': [],
+        'networks': ['itbox-network']
+    }
+
+    # Ports
+    for port in container_def['ports']:
+        bind = port.get('bind', '0.0.0.0')
+        if bind == '0.0.0.0':
+            port_str = f"{port['host']}:{port['container']}/{port['protocol']}"
+        else:
+            port_str = f"{bind}:{port['host']}:{port['container']}/{port['protocol']}"
+        service['ports'].append(port_str)
+
+    # Volumes
+    for vol in container_def['volumes']:
+        vol_str = f"{vol['host']}:{vol['container']}"
+        if vol.get('readonly'):
+            vol_str += ":ro"
+        service['volumes'].append(vol_str)
+
+    # Environment
+    if container_def.get('environment'):
+        service['environment'] = []
+        for env in container_def['environment']:
+            service['environment'].append(f"{env['key']}={env['value']}")
+
+    # Dependencies
+    if depends_on:
+        service['depends_on'] = depends_on
+
+    compose_data['services'][container_id] = service
+    manager.save_compose(compose_data)
+    print_done()
+
+    # Update .env
+    if secrets:
+        print_step("Updating .env")
+        manager.save_env(env_vars)
+        print_done()
+
+    # Update state
+    print_step("Updating state")
+    state['containers'][container_id] = {
+        'installed': True,
+        'enabled': True,
+        'version': container_def['version'],
+        'installed_at': datetime.now().isoformat(),
+        'ports': [p['host'] for p in container_def['ports']]
+    }
+
+    for port in container_def['ports']:
+        state['ports']['allocated'][str(port['host'])] = container_id
+
+    manager.save_state(state)
+    print_done()
+
+    # Start container
+    print_step("Starting container")
+    os.chdir(manager.compose_dir)
+    run_command(f"docker-compose up -d {container_id}")
+    print_done()
+
+    # Show post-install messages
+    print_success(f"{container_def['name']} installed successfully!")
+
+    post_install = container_def.get('post_install', {})
+    if post_install.get('messages'):
+        print()
+        for msg in post_install['messages']:
+            print(f"  {msg}")
+
+    # Show optional secrets info
+    optional_secrets = container_def.get('optional_secrets', [])
+    if optional_secrets:
+        print()
+        print_info("Optional API keys can be added later:")
+        for secret in optional_secrets:
+            print(f"  sudo boxctl secrets set {secret['key']}")
+
+
+def cmd_remove(args):
+    """Remove a container"""
+    ensure_root()
+
+    if not args.container:
+        print_error("Usage: boxctl remove <container>")
+        sys.exit(1)
+
+    container_id = args.container
+    manager = ContainerManager()
+
+    state = manager.load_state()
+
+    if container_id not in state['containers']:
+        print_error(f"{container_id} is not installed")
+        sys.exit(1)
+
+    # Check if required
+    catalog = manager.load_catalog()
+    for container in catalog['containers']:
+        if container['id'] == container_id and container.get('required'):
+            print_error(f"{container_id} is required and cannot be removed")
+            sys.exit(1)
+
+    print_header(f"Removing {container_id}")
+
+    response = input("Are you sure? [y/N]: ").strip().lower()
+    if response not in ['y', 'yes']:
+        print("Removal cancelled.")
+        sys.exit(0)
+
+    # Stop and remove container
+    print_step("Stopping container")
+    os.chdir(manager.compose_dir)
+    run_command(f"docker-compose down {container_id}", check=False)
+    print_done()
+
+    # Remove from docker-compose.yml
+    print_step("Updating docker-compose.yml")
+    compose_data = manager.load_compose()
+    if container_id in compose_data['services']:
+        del compose_data['services'][container_id]
+    manager.save_compose(compose_data)
+    print_done()
+
+    # Update state
+    print_step("Updating state")
+    container_info = state['containers'][container_id]
+    for port in container_info['ports']:
+        if str(port) in state['ports']['allocated']:
+            del state['ports']['allocated'][str(port)]
+
+    del state['containers'][container_id]
+    manager.save_state(state)
+    print_done()
+
+    # Ask about data
+    if not args.keep_data:
+        response = input(f"\nRemove data directory /opt/itbox/data/{container_id}? [y/N]: ").strip().lower()
+        if response in ['y', 'yes']:
+            data_path = manager.data_dir / container_id
+            if data_path.exists():
+                print_step(f"Removing {data_path}")
+                shutil.rmtree(data_path)
+                print_done()
+
+    print_success(f"{container_id} removed successfully!")
+
+
+def cmd_status(args):
+    """Show status of installed containers"""
+    manager = ContainerManager()
+
+    if not manager.state_file.exists():
+        print_error("boxctl not installed. Run 'sudo boxctl install' first.")
+        sys.exit(1)
+
+    state = manager.load_state()
+
+    print_header("IT.Box Status")
+
+    if not state['containers']:
+        print("No containers installed.")
+        print_info("Add containers: sudo boxctl add <name>")
+        return
+
+    # Get Docker status
+    os.chdir(manager.compose_dir)
+    result = run_command("docker-compose ps", capture_output=True, check=False)
+
+    print("Installed Containers:")
+    for container_id, info in state['containers'].items():
+        status = "●" if info.get('enabled') else "○"
+        ports = ', '.join([f"{p}" for p in info['ports']])
+        print(f"  {status} {container_id:<20} Ports: {ports}")
+
+    print("\nDocker Status:")
+    if result.stdout:
+        print(result.stdout)
+
+
+def cmd_ports(args):
+    """Show port information"""
+    manager = ContainerManager()
+
+    if not manager.state_file.exists():
+        print_error("boxctl not installed. Run 'sudo boxctl install' first.")
+        sys.exit(1)
+
+    state = manager.load_state()
+
+    if args.container:
+        # Show specific container
+        container_id = args.container
+        if container_id not in state['containers']:
+            print_error(f"{container_id} is not installed")
+            sys.exit(1)
+
+        container_def = manager.load_container_def(container_id)
+
+        print_header(f"{container_def['name']} Ports")
+
+        for port_info in container_def['ports']:
+            port = port_info['host']
+            protocol = port_info['protocol']
+            desc = port_info['description']
+
+            print(f"{port}/{protocol} - {desc}")
+
+            # Show tunnel hint from post_install
+            post_install = container_def.get('post_install', {})
+            ports_info = post_install.get('ports_info', [])
+            for pi in ports_info:
+                if pi['port'] == port:
+                    print(f"  {pi['description']}")
+    else:
+        # Show all containers
+        print_header("Port Allocation")
+
+        for container_id in state['containers']:
+            container_def = manager.load_container_def(container_id)
+            print(f"\n{container_def['name']}:")
+
+            for port_info in container_def['ports']:
+                port = port_info['host']
+                protocol = port_info['protocol']
+                desc = port_info['description']
+                print(f"  {port}/{protocol} - {desc}")
+
+
+# ============================================================================
+# CLI
+# ============================================================================
+
+def main():
+    """Main entry point"""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description=f"boxctl {VERSION} - IT.Box Container Management",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+
+    subparsers = parser.add_subparsers(dest='command', help='Commands')
+
+    # install
+    parser_install = subparsers.add_parser('install', help='Install boxctl')
+
+    # sync
+    parser_sync = subparsers.add_parser('sync', help='Sync container catalog')
+
+    # list
+    parser_list = subparsers.add_parser('list', help='List available containers')
+
+    # add
+    parser_add = subparsers.add_parser('add', help='Add container')
+    parser_add.add_argument('container', help='Container ID')
+
+    # remove
+    parser_remove = subparsers.add_parser('remove', help='Remove container')
+    parser_remove.add_argument('container', help='Container ID')
+    parser_remove.add_argument('--keep-data', action='store_true', help='Keep data directory')
+
+    # status
+    parser_status = subparsers.add_parser('status', help='Show status')
+
+    # ports
+    parser_ports = subparsers.add_parser('ports', help='Show port information')
+    parser_ports.add_argument('container', nargs='?', help='Container ID (optional)')
+
+    # version
+    parser_version = subparsers.add_parser('version', help='Show version')
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(0)
+
+    # Route to command
+    if args.command == 'install':
+        cmd_install(args)
+    elif args.command == 'sync':
+        cmd_sync(args)
+    elif args.command == 'list':
+        cmd_list(args)
+    elif args.command == 'add':
+        cmd_add(args)
+    elif args.command == 'remove':
+        cmd_remove(args)
+    elif args.command == 'status':
+        cmd_status(args)
+    elif args.command == 'ports':
+        cmd_ports(args)
+    elif args.command == 'version':
+        print(f"boxctl version {VERSION}")
+    else:
+        parser.print_help()
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\nAborted by user.")
+        sys.exit(130)
+    except Exception as e:
+        print_error(f"Unexpected error: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)

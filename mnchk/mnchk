@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+"""
+mnchk - moin.schule Credential Checker
+Validates username/password against moin.schule SSO
+
+Exit Codes:
+  0 - Credentials valid
+  1 - Credentials invalid
+  2 - Usage error or system error
+
+Usage:
+  sudo mnchk install                              # Install to /usr/local/bin
+  mnchk --user <username> --password <pass>       # Check credentials
+  mnchk --user <username> --password-stdin        # Read password from stdin
+  mnchk --user <username> --password-file <file>  # Read password from file
+  mnchk --user <username>                         # Interactive password prompt
+  mnchk --user <user> --password <pass> --json    # JSON output
+"""
+
+import sys
+import os
+import shutil
+import getpass
+
+try:
+    import requests
+except ImportError:
+    print("Error: requests not installed. Run: sudo apt install python3-requests", file=sys.stderr)
+    sys.exit(2)
+
+# Configuration
+TOKEN_ENDPOINT = "https://auth.moin.schule/realms/moins/protocol/openid-connect/token"
+CLIENT_ID = "admin-cli"
+VERSION = "2.0.0"
+
+
+def check_credentials(username, password, verbose=False):
+    """
+    Check if username/password is valid in moin.schule
+
+    Uses the trick that Keycloak validates credentials BEFORE account status:
+    - "Invalid user credentials" = wrong password
+    - "Account is not fully set up" = correct password, incomplete account
+    - Status 200 = correct password, complete account
+
+    Args:
+        username: Username to check
+        password: Password to check
+        verbose: Return detailed info (for JSON output)
+
+    Returns:
+        bool or dict: True/False if not verbose, dict with details if verbose
+    """
+    try:
+        response = requests.post(
+            TOKEN_ENDPOINT,
+            data={
+                "grant_type": "password",
+                "username": username,
+                "password": password,
+                "client_id": CLIENT_ID,
+                "scope": "openid"
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=10
+        )
+
+        # Success - Account fully set up
+        if response.status_code == 200:
+            if verbose:
+                return {
+                    "valid": True,
+                    "status": "success",
+                    "message": "Credentials valid, account complete"
+                }
+            return True
+
+        # Check error response
+        try:
+            error = response.json()
+            error_desc = error.get('error_description', '').lower()
+
+            # Account incomplete BUT password is correct!
+            if 'account is not fully set up' in error_desc:
+                if verbose:
+                    return {
+                        "valid": True,
+                        "status": "incomplete_account",
+                        "message": "Credentials valid, account setup incomplete"
+                    }
+                return True
+
+            # Invalid credentials
+            if 'invalid user credentials' in error_desc:
+                if verbose:
+                    return {
+                        "valid": False,
+                        "status": "invalid_credentials",
+                        "message": "Invalid username or password"
+                    }
+                return False
+
+            # Other error
+            if verbose:
+                return {
+                    "valid": False,
+                    "status": "error",
+                    "message": f"Authentication error: {error_desc}"
+                }
+            return False
+
+        except Exception as e:
+            if verbose:
+                return {
+                    "valid": False,
+                    "status": "error",
+                    "message": f"Failed to parse response: {str(e)}"
+                }
+            return False
+
+    except requests.exceptions.Timeout:
+        if verbose:
+            return {
+                "valid": False,
+                "status": "error",
+                "message": "Connection timeout"
+            }
+        return False
+    except requests.exceptions.RequestException as e:
+        if verbose:
+            return {
+                "valid": False,
+                "status": "error",
+                "message": f"Connection error: {str(e)}"
+            }
+        return False
+    except Exception as e:
+        if verbose:
+            return {
+                "valid": False,
+                "status": "error",
+                "message": f"Unexpected error: {str(e)}"
+            }
+        return False
+
+
+def install():
+    """Install mnchk to /usr/local/bin/"""
+    if os.geteuid() != 0:
+        print("Error: Installation requires root privileges. Run with sudo.", file=sys.stderr)
+        sys.exit(2)
+
+    script_path = os.path.abspath(__file__)
+    target_path = "/usr/local/bin/mnchk"
+
+    # Check if requests is available
+    try:
+        import requests
+    except ImportError:
+        print("Warning: python3-requests not installed.", file=sys.stderr)
+        print("  Install with: sudo apt install python3-requests", file=sys.stderr)
+        response = input("\nContinue installation anyway? [y/N]: ").strip().lower()
+        if response not in ['y', 'yes']:
+            print("Installation cancelled.")
+            sys.exit(0)
+
+    try:
+        # Copy script
+        shutil.copy2(script_path, target_path)
+        # Make executable
+        os.chmod(target_path, 0o755)
+
+        print("✓ mnchk installed successfully!")
+        print(f"  Location: {target_path}")
+        print("\nUsage:")
+        print("  mnchk --user <username>                         # Interactive prompt (RECOMMENDED)")
+        print("  echo 'pass' | mnchk --user <user> --password-stdin")
+        print("  mnchk --user <user> --password-file <file>")
+        print("  mnchk --user <user> --password <pass>           # For testing only!")
+        print("\nExit codes:")
+        print("  0 - Credentials valid")
+        print("  1 - Credentials invalid")
+        print("  2 - Error")
+        print("\nSecurity Note:")
+        print("  Use --password-stdin or interactive mode to avoid bash history issues!")
+        sys.exit(0)
+
+    except Exception as e:
+        print(f"Error: Installation failed: {e}", file=sys.stderr)
+        sys.exit(2)
+
+
+def main():
+    """Main entry point"""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description=f"mnchk {VERSION} - moin.schule credential checker",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Exit Codes:
+  0 - Credentials valid
+  1 - Credentials invalid
+  2 - Usage error or system error
+
+Examples:
+  sudo mnchk install
+  mnchk --user max.mustermann --password geheim123
+  mnchk --user max.mustermann                          # Interactive prompt
+  echo "geheim123" | mnchk --user max --password-stdin
+  mnchk --user max --password-file /path/to/passfile
+  mnchk --user test --password test --json
+
+  # Use in scripts (SECURE - avoids shell history):
+  mnchk --user "$USER" --password-stdin <<< "$PASS"
+
+  # Or with password file:
+  echo "$PASS" > /tmp/pass && mnchk --user "$USER" --password-file /tmp/pass
+"""
+    )
+
+    parser.add_argument('command', nargs='?', choices=['install'],
+                       help='Install mnchk to /usr/local/bin')
+    parser.add_argument('--user', '-u', help='Username to check')
+    parser.add_argument('--password', '-p', help='Password to check')
+    parser.add_argument('--password-stdin', action='store_true',
+                       help='Read password from stdin')
+    parser.add_argument('--password-file', metavar='FILE',
+                       help='Read password from file')
+    parser.add_argument('--json', action='store_true',
+                       help='Output result as JSON')
+    parser.add_argument('--version', action='version',
+                       version=f'mnchk {VERSION}')
+
+    args = parser.parse_args()
+
+    # Install command
+    if args.command == 'install':
+        install()
+
+    # Validate username
+    if not args.user:
+        if not sys.stdin.isatty():
+            sys.exit(2)
+        else:
+            parser.print_help()
+            sys.exit(2)
+
+    # Get password from various sources
+    password = None
+
+    if args.password:
+        password = args.password
+    elif args.password_stdin:
+        # Read from stdin
+        try:
+            password = sys.stdin.readline().rstrip('\n\r')
+        except Exception as e:
+            print(f"Error reading password from stdin: {e}", file=sys.stderr)
+            sys.exit(2)
+    elif args.password_file:
+        # Read from file
+        try:
+            with open(args.password_file, 'r') as f:
+                password = f.read().rstrip('\n\r')
+        except Exception as e:
+            print(f"Error reading password from file: {e}", file=sys.stderr)
+            sys.exit(2)
+    else:
+        # Interactive prompt (only if stdin is a tty)
+        if sys.stdin.isatty():
+            try:
+                password = getpass.getpass(f"Password for {args.user}: ")
+            except KeyboardInterrupt:
+                print("\nAborted.", file=sys.stderr)
+                sys.exit(130)
+            except Exception as e:
+                print(f"Error reading password: {e}", file=sys.stderr)
+                sys.exit(2)
+        else:
+            print("Error: No password provided. Use --password, --password-stdin, or --password-file", file=sys.stderr)
+            sys.exit(2)
+
+    if not password:
+        print("Error: Password is empty", file=sys.stderr)
+        sys.exit(2)
+
+    # Check credentials
+    result = check_credentials(args.user, password, verbose=args.json)
+
+    # Output
+    if args.json:
+        import json
+        result['user'] = args.user
+        print(json.dumps(result))
+        valid = result['valid']
+    else:
+        # Simple true/false for easy parsing
+        valid = result
+        print("true" if valid else "false")
+
+    # Exit code: 0 = valid, 1 = invalid
+    sys.exit(0 if valid else 1)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nAborted.", file=sys.stderr)
+        sys.exit(130)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(2)

@@ -1,0 +1,167 @@
+id: minecraft
+name: "Minecraft Server"
+version: "1.0"
+description: "Minecraft Java Edition Server für Schüler-Projekte"
+category: games
+
+links:
+  homepage: "https://www.minecraft.net/"
+  docs: "https://minecraft.fandom.com/wiki/Server"
+  github: "https://github.com/itzg/docker-minecraft-server"
+
+prompts:
+  - key: "SERVER_NAME"
+    question: "Wie soll der Minecraft-Server heißen?"
+    default: "IT.Box Minecraft Server"
+    description: "Name des Servers in der Serverliste"
+
+  - key: "GAMEMODE"
+    question: "Welcher Spielmodus soll verwendet werden?"
+    default: "creative"
+    description: "Creative für Bauprojekte, Survival für Überlebensmodus"
+    options:
+      - "survival"
+      - "creative"
+      - "adventure"
+      - "spectator"
+
+  - key: "DIFFICULTY"
+    question: "Welche Schwierigkeitsstufe?"
+    default: "normal"
+    options:
+      - "peaceful"
+      - "easy"
+      - "normal"
+      - "hard"
+
+  - key: "MAX_PLAYERS"
+    question: "Maximale Anzahl Spieler?"
+    default: "20"
+    description: "Anzahl gleichzeitiger Spieler (1-100)"
+    validate: "int"
+
+  - key: "VIEW_DISTANCE"
+    question: "Sichtweite in Chunks (empfohlen: 8-12 für Raspberry Pi)?"
+    default: "10"
+    description: "Höhere Werte = mehr RAM-Verbrauch"
+    validate: "int"
+
+  - key: "ENABLE_COMMAND_BLOCK"
+    question: "Command Blocks aktivieren (für Redstone-Projekte)?"
+    default: "true"
+    options:
+      - "true"
+      - "false"
+
+image:
+  name: "itzg/minecraft-server"
+  tag: "java17"
+
+ports:
+  - host: 25565
+    container: 25565
+    protocol: tcp
+    description: "Minecraft Server Port"
+
+  - host: 25575
+    container: 25575
+    protocol: tcp
+    description: "RCON Port (Remote Console)"
+
+volumes:
+  - host: "/opt/itbox/data/minecraft"
+    container: "/data"
+    description: "Welten, Configs und Plugins"
+
+environment:
+  # Basis-Konfiguration
+  - key: "EULA"
+    value: "TRUE"
+
+  - key: "TYPE"
+    value: "VANILLA"
+
+  - key: "VERSION"
+    value: "LATEST"
+
+  # User-konfigurierbare Werte (aus prompts)
+  - key: "SERVER_NAME"
+    value: "${SERVER_NAME}"
+
+  - key: "MOTD"
+    value: "${SERVER_NAME} - IT.Box Schul-Server"
+
+  - key: "MODE"
+    value: "${GAMEMODE}"
+
+  - key: "DIFFICULTY"
+    value: "${DIFFICULTY}"
+
+  - key: "MAX_PLAYERS"
+    value: "${MAX_PLAYERS}"
+
+  - key: "VIEW_DISTANCE"
+    value: "${VIEW_DISTANCE}"
+
+  - key: "ENABLE_COMMAND_BLOCK"
+    value: "${ENABLE_COMMAND_BLOCK}"
+
+  # Performance-Optimierung für Raspberry Pi
+  - key: "MEMORY"
+    value: "2G"
+
+  - key: "JVM_OPTS"
+    value: "-Xms512M -Xmx2G"
+
+  # Sicherheit
+  - key: "ENABLE_RCON"
+    value: "true"
+
+  - key: "RCON_PASSWORD"
+    value: "${RCON_PASSWORD}"
+
+  - key: "ONLINE_MODE"
+    value: "true"
+
+  - key: "ENFORCE_WHITELIST"
+    value: "false"
+
+  # Backup & Logging
+  - key: "ENABLE_ROLLING_LOGS"
+    value: "true"
+
+secrets:
+  - key: "RCON_PASSWORD"
+    description: "Passwort für Remote Console (RCON)"
+    required: true
+    generate: "password"
+
+optional_secrets: []
+
+depends_on: []
+
+post_install:
+  messages:
+    - "✅ Minecraft Server läuft auf itbox.local:25565"
+    - "🎮 Spielmodus: ${GAMEMODE} | Schwierigkeit: ${DIFFICULTY}"
+    - "👥 Max. Spieler: ${MAX_PLAYERS}"
+    - "🔧 RCON Admin-Zugang: itbox.local:25575"
+    - "   Passwort: Siehe .env → RCON_PASSWORD"
+    - "📂 Server-Dateien: /opt/itbox/data/minecraft"
+    - "💡 Whitelist aktivieren: docker exec minecraft mc-send-to-console whitelist on"
+    - "💡 Spieler hinzufügen: docker exec minecraft mc-send-to-console whitelist add <name>"
+    - "📚 Weitere Commands: https://minecraft.fandom.com/wiki/Commands"
+
+  ports_info:
+    - port: 25565
+      protocol: tcp
+      description: "Minecraft Server - Für Tunnel: sudo tnl add minecraft 25565"
+
+    - port: 25575
+      protocol: tcp
+      description: "RCON Admin Console - Für Tunnel: sudo tnl add minecraft-rcon 25575"
+
+resources:
+  ram_mb: 2500
+  cpu_cores: 1.5
+  disk_mb: 2000
