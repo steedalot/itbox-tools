@@ -2046,7 +2046,7 @@ def cmd_update(args):
     print(f"✓ gtwy updated successfully: {installed_version} → {current_version}")
     print("="*60)
     print(f"\nBackup stored at: {backup_dir}")
-    print("\nChangelog: https://github.com/steedalot/tnld/releases")
+    print("\nChangelog: https://github.com/steedalot/itbox-tools/releases")
 
 # ============================================================================
 # COMMANDS - SETUP

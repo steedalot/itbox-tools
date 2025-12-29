@@ -513,7 +513,7 @@ def cmd_update(args):
     print(f"\nBackup stored at: {backup_dir}")
     print(f"\nServices are still running - no restart required!")
     print("The update is active for all new 'tnl' commands.")
-    print("\nChangelog: https://github.com/steedalot/tnld/releases")
+    print("\nChangelog: https://github.com/steedalot/itbox-tools/releases")
 
 def cmd_setup(args):
     """Setup admin SSH tunnel to gateway server."""
