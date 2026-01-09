@@ -347,9 +347,3 @@ sudo rm /usr/local/bin/mnchk
 - JSON output support
 - Installation via `mnchk install`
 - Production endpoint configuration
-
-## Support
-
-Bei Fragen oder Problemen:
-- IT.Box Projekt: https://github.com/n-21/itbox
-- moin.schule Support: https://moin.schule
